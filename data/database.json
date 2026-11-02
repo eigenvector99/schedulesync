@@ -1,0 +1,394 @@
+{
+  "users": [
+    {
+      "id": "emp-admin",
+      "email": "admin@company.internal",
+      "name": "총괄관리자",
+      "departmentId": "dept-1",
+      "role": "ADMIN",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-slate-700",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "99af3b8c243ba292105e9b00519bf8395e3927ef6e50019b342392e180505ce1007f56a2984ae404a3b4c1f7021727dea318992153b43dd3f4a909f48bcf0ad5"
+    },
+    {
+      "id": "emp-approver-a",
+      "email": "a.kim@company.internal",
+      "name": "김부서장 (허가권자 A)",
+      "departmentId": "dept-1",
+      "role": "APPROVER",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-blue-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "461feacaaf904861e1a43a21454c8ecd76120a2b4e19a5a51dfccd873710aea3f802126c6fe004c90325b689596aa97ac8ca8303567f769f0d41757a9a2edbfd"
+    },
+    {
+      "id": "emp-approver-b",
+      "email": "b.lee@company.internal",
+      "name": "이부서장 (허가권자 B)",
+      "departmentId": "dept-2",
+      "role": "APPROVER",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-purple-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "8b110e424d0c0ac83f41be0b7c3201dea0702dd4e2028e0c8570bc897a7df225d804a0a1530afade2470fd3924a12a906b1d3685cb2102f049007ecd52f3fef3"
+    },
+    {
+      "id": "emp-dev-1",
+      "email": "park.dev@company.internal",
+      "name": "박개발",
+      "departmentId": "dept-1",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-cyan-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "303f50f1e2ebe21ac488e028920e47c2a3b04f5661a62a7eacaed5595a02b1381bba2f3687386a7696399156652613b31139e78fc01fc9a737c2657c450b33c1"
+    },
+    {
+      "id": "emp-dev-2",
+      "email": "jung.eng@company.internal",
+      "name": "정엔지니어",
+      "departmentId": "dept-1",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-sky-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "e195fffb2364f2d40e461a3f324404779d2acdb96b64e38ed2a87a7c56a5f72b361cd8adf2ab615188bbfe88897fa08900ec2046303aa4f35d519dfb70131c95"
+    },
+    {
+      "id": "emp-dev-3",
+      "email": "choi.back@company.internal",
+      "name": "최백엔드",
+      "departmentId": "dept-1",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-indigo-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "9c8b87d34d6f247440a786dc45b6e9f900e3eede927cda4c9631677fd0c0e1941bb1fe6d3abe058d2a13b51f72112eb552adb492755ae71a794bfada9bead8aa"
+    },
+    {
+      "id": "emp-des-1",
+      "email": "kang.des@company.internal",
+      "name": "강디자이너",
+      "departmentId": "dept-2",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-fuchsia-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "e4cd05aa3195d56e4a8c812b552761f05fa7f74eecaee1cad222496d8f0bbaef9b0bf22d2489c28a32f27cf262ce4332c179e69f0ebf678a2cfe24d31d5202d3"
+    },
+    {
+      "id": "emp-des-2",
+      "email": "yoon.ui@company.internal",
+      "name": "윤UI/UX",
+      "departmentId": "dept-2",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-pink-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "12ebd26fb4800405b2807781f6cac3bdc2662f900a750ac5f8ea36201e4d6cf3307708725f8a003d86a412cb7189346e0fd21b3701e46750d1ebf7234002759a"
+    },
+    {
+      "id": "emp-des-3",
+      "email": "han.gra@company.internal",
+      "name": "한그래픽",
+      "departmentId": "dept-2",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-rose-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "0022f6ffb0dd49b415dcdf4ac4a7a1c96daccbe6c692333fc1e4f6256fbb7b6d4553d6e0b443328c6be24e9d4715f90876b90ba62c4ee44de3463dfe20041f79"
+    },
+    {
+      "id": "emp-des-4",
+      "email": "song.prod@company.internal",
+      "name": "송프로덕트",
+      "departmentId": "dept-2",
+      "role": "EMPLOYEE",
+      "status": "ACTIVE",
+      "timezone": "Asia/Seoul",
+      "avatarColor": "bg-amber-600",
+      "passwordSalt": "common_company_salt_2026",
+      "passwordHash": "2dba62aed962cd5c06ce353f520aadb533ea46b78162d141013ef1dc65e3ca33e4abcdb872be5c7cd021309b3a01b7ba11b69558bcb4af007ee0b6c25ab53a53"
+    }
+  ],
+  "departments": [
+    {
+      "id": "dept-1",
+      "name": "플랫폼개발팀",
+      "headEmployeeId": "emp-approver-a"
+    },
+    {
+      "id": "dept-2",
+      "name": "프로덕트디자인팀",
+      "headEmployeeId": "emp-approver-b"
+    }
+  ],
+  "projects": [
+    {
+      "id": "proj-1",
+      "name": "AI 스마트 검색 엔진 구축",
+      "description": "검색 지연시간 개선 및 멀티모달 임베딩 파이프라인 개발",
+      "createdBy": "emp-approver-a",
+      "startDate": "2026-11-01",
+      "endDate": "2026-12-31",
+      "status": "IN_PROGRESS",
+      "headcount": 3,
+      "color": "#2563eb",
+      "createdAt": "2026-11-01T09:00:00Z",
+      "updatedAt": "2026-11-01T09:00:00Z"
+    },
+    {
+      "id": "proj-2",
+      "name": "2026 차세대 디자인 시스템 개편",
+      "description": "디자인 토큰 통일 및 인터랙션 컴포넌트 라이브러리 2.0 구축",
+      "createdBy": "emp-approver-b",
+      "startDate": "2026-11-01",
+      "endDate": "2026-12-31",
+      "status": "IN_PROGRESS",
+      "headcount": 4,
+      "color": "#7c3aed",
+      "createdAt": "2026-11-01T09:30:00Z",
+      "updatedAt": "2026-11-01T09:30:00Z"
+    },
+    {
+      "id": "proj-3",
+      "name": "모바일 온보딩 TF (경험 고도화)",
+      "description": "신규 고객 유입 후 첫 주 잔존율 상승을 위한 온보딩 프로세스 혁신",
+      "createdBy": "emp-approver-a",
+      "startDate": "2026-11-01",
+      "endDate": "2026-12-31",
+      "status": "RECRUITING",
+      "headcount": 3,
+      "color": "#059669",
+      "createdAt": "2026-11-01T10:00:00Z",
+      "updatedAt": "2026-11-01T10:00:00Z"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "sess-1",
+      "projectId": "proj-1",
+      "title": "검색 엔진 코어 스프린트",
+      "startAt": "2026-11-01T14:00:00Z",
+      "endAt": "2026-12-31T17:00:00Z",
+      "rrule": "FREQ=WEEKLY;BYDAY=TU,TH",
+      "daysOfWeek": [
+        2,
+        4
+      ],
+      "startTime": "14:00",
+      "endTime": "17:00",
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "id": "sess-2",
+      "projectId": "proj-2",
+      "title": "디자인 시스템 코어 워크숍",
+      "startAt": "2026-11-01T10:00:00Z",
+      "endAt": "2026-12-31T13:00:00Z",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,WE",
+      "daysOfWeek": [
+        1,
+        3
+      ],
+      "startTime": "10:00",
+      "endTime": "13:00",
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "id": "sess-3",
+      "projectId": "proj-3",
+      "title": "온보딩 TF 집중 작업",
+      "startAt": "2026-11-01T15:00:00Z",
+      "endAt": "2026-12-31T18:00:00Z",
+      "rrule": "FREQ=WEEKLY;BYDAY=TU,TH",
+      "daysOfWeek": [
+        2,
+        4
+      ],
+      "startTime": "15:00",
+      "endTime": "18:00",
+      "timezone": "Asia/Seoul"
+    }
+  ],
+  "assignments": [
+    {
+      "id": "asg-1",
+      "projectId": "proj-1",
+      "employeeId": "emp-dev-1",
+      "assignedBy": "emp-approver-a",
+      "type": "EMPLOYEE",
+      "status": "APPROVED",
+      "createdAt": "2026-11-01T10:10:00Z",
+      "updatedAt": "2026-11-01T10:15:00Z",
+      "approvalDecisions": [
+        {
+          "id": "dec-1",
+          "assignmentId": "asg-1",
+          "approverId": "emp-approver-a",
+          "decision": "APPROVED",
+          "comment": "플랫폼 코어 개발 리드 승인",
+          "decidedAt": "2026-11-01T10:14:00Z"
+        },
+        {
+          "id": "dec-2",
+          "assignmentId": "asg-1",
+          "approverId": "emp-approver-b",
+          "decision": "APPROVED",
+          "comment": "일정 확인 및 승인 완료",
+          "decidedAt": "2026-11-01T10:15:00Z"
+        }
+      ]
+    },
+    {
+      "id": "asg-2",
+      "projectId": "proj-1",
+      "employeeId": "emp-des-1",
+      "assignedBy": "emp-approver-a",
+      "type": "EMPLOYEE",
+      "status": "APPROVAL_PENDING",
+      "createdAt": "2026-11-01T11:00:00Z",
+      "updatedAt": "2026-11-01T11:20:00Z",
+      "approvalDecisions": [
+        {
+          "id": "dec-3",
+          "assignmentId": "asg-2",
+          "approverId": "emp-approver-a",
+          "decision": "APPROVED",
+          "comment": "검색 UI 디자인 지원 투입 요청 승인",
+          "decidedAt": "2026-11-01T11:22:00Z"
+        },
+        {
+          "id": "dec-4",
+          "assignmentId": "asg-2",
+          "approverId": "emp-approver-b",
+          "decision": "PENDING"
+        }
+      ]
+    },
+    {
+      "id": "asg-3",
+      "projectId": "proj-2",
+      "employeeId": "emp-approver-b",
+      "assignedBy": "emp-approver-b",
+      "type": "SELF",
+      "status": "APPROVED",
+      "createdAt": "2026-11-01T09:40:00Z",
+      "updatedAt": "2026-11-01T09:40:00Z",
+      "approvalDecisions": []
+    },
+    {
+      "id": "asg-4",
+      "projectId": "proj-2",
+      "employeeId": "emp-des-2",
+      "assignedBy": "emp-approver-b",
+      "type": "EMPLOYEE",
+      "status": "APPROVED",
+      "createdAt": "2026-11-01T09:45:00Z",
+      "updatedAt": "2026-11-01T09:55:00Z",
+      "approvalDecisions": [
+        {
+          "id": "dec-5",
+          "assignmentId": "asg-4",
+          "approverId": "emp-approver-a",
+          "decision": "APPROVED",
+          "decidedAt": "2026-11-01T09:50:00Z"
+        },
+        {
+          "id": "dec-6",
+          "assignmentId": "asg-4",
+          "approverId": "emp-approver-b",
+          "decision": "APPROVED",
+          "decidedAt": "2026-11-01T09:55:00Z"
+        }
+      ]
+    },
+    {
+      "id": "asg-5",
+      "projectId": "proj-2",
+      "employeeId": "emp-dev-2",
+      "assignedBy": "emp-approver-b",
+      "type": "EMPLOYEE",
+      "status": "EMPLOYEE_PENDING",
+      "createdAt": "2026-11-01T10:30:00Z",
+      "updatedAt": "2026-11-01T10:30:00Z",
+      "approvalDecisions": [
+        {
+          "id": "dec-7",
+          "assignmentId": "asg-5",
+          "approverId": "emp-approver-a",
+          "decision": "PENDING"
+        },
+        {
+          "id": "dec-8",
+          "assignmentId": "asg-5",
+          "approverId": "emp-approver-b",
+          "decision": "PENDING"
+        }
+      ]
+    }
+  ],
+  "changeRequests": [],
+  "allowedOverlaps": [],
+  "notifications": [
+    {
+      "id": "noti-1",
+      "recipientId": "emp-approver-b",
+      "type": "APPROVAL_REQUEST",
+      "title": "배정 승인 요청",
+      "message": "[AI 스마트 검색 엔진 구축] 프로젝트에 강디자이너 배정 건에 대해 승인이 필요합니다.",
+      "read": false,
+      "linkTab": "inbox",
+      "createdAt": "2026-11-01T11:22:00Z"
+    }
+  ],
+  "mockEmails": [
+    {
+      "id": "mail-1",
+      "to": "b.lee@company.internal",
+      "toName": "이부서장",
+      "subject": "[스케줄 승인 요청] AI 스마트 검색 엔진 구축 - 강디자이너 배정",
+      "body": "이부서장님께,\n\n김부서장님이 등록한 [AI 스마트 검색 엔진 구축] 프로젝트에 강디자이너님이 배정을 수락하였습니다.\n\n허가권자 전원 승인 규칙에 따라 이부서장님의 승인이 필요합니다.",
+      "sentAt": "2026-11-01T11:22:00Z"
+    }
+  ],
+  "auditLogs": [
+    {
+      "id": "log-1793603808793-fi5i",
+      "actorId": "emp-approver-a",
+      "actorName": "김부서장 (허가권자 A)",
+      "action": "USER_LOGIN",
+      "targetType": "EMPLOYEE",
+      "targetId": "emp-approver-a",
+      "details": "로그인 성공 (a.kim@company.internal)",
+      "createdAt": "2026-11-02T07:16:48.793Z"
+    },
+    {
+      "id": "log-1",
+      "actorId": "emp-admin",
+      "actorName": "총괄관리자",
+      "action": "INITIALIZE_SYSTEM",
+      "targetType": "DEPARTMENT",
+      "targetId": "dept-1",
+      "details": "시스템 가동 및 초기 부서/계정 마운트 완료",
+      "createdAt": "2026-11-01T08:00:00Z"
+    }
+  ],
+  "tokens": [
+    {
+      "token": "tok_b9bb168a5c2fd3bebb381dea053bb77a9171a2e5235904b8",
+      "userId": "emp-approver-a",
+      "expiresAt": "2026-11-09T07:16:48.792Z"
+    }
+  ]
+}
