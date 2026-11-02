@@ -399,12 +399,12 @@ export const Header: React.FC<HeaderProps> = ({ onOpenEmailDrawer }) => {
 
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">
-                  새 비밀번호 (6자 이상)
+                  새 비밀번호 (10자 이상, 영문+숫자)
                 </label>
                 <input
                   type="password"
                   required
-                  minLength={6}
+                  minLength={10}
                   value={nextPassword}
                   onChange={(e) => setNextPassword(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg text-slate-900"

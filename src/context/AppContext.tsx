@@ -41,7 +41,7 @@ interface AppContextType {
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
   changePassword: (curr: string, next: string) => Promise<{ success: boolean; error?: string }>;
-  requestPasswordReset: (email: string) => Promise<{ success: boolean; token?: string; error?: string }>;
+  requestPasswordReset: (email: string) => Promise<{ success: boolean; error?: string }>;
   confirmPasswordReset: (token: string, next: string) => Promise<{ success: boolean; error?: string }>;
 
   // Domain actions
@@ -108,12 +108,12 @@ interface AppContextType {
   createEmployeeAccount: (
     data: Omit<Employee, 'id' | 'status' | 'failedLoginCount'>
   ) => Promise<{ success: boolean; error?: string }>;
+  createDepartment: (name: string) => Promise<{ success: boolean; error?: string }>;
   toggleEmployeeStatus: (employeeId: string) => Promise<{ success: boolean; error?: string }>;
   updateDepartmentHead: (departmentId: string, headEmployeeId: string) => Promise<{ success: boolean; error?: string }>;
 
   // Refresh
   refreshState: () => Promise<void>;
-  resetAllData: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -292,7 +292,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       const data = await res.json();
       if (res.ok) {
-        return { success: true, token: data.token };
+        return { success: true };
       }
       return { success: false, error: data.error };
     } catch (e: any) {
@@ -730,6 +730,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  const createDepartment = async (name: string) => {
+    try {
+      const res = await fetch('/api/admin/departments', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ name }),
+      });
+      const result = await res.json();
+      if (res.ok) {
+        await refreshState();
+        return { success: true };
+      }
+      return { success: false, error: result.error };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  };
+
   const toggleEmployeeStatus = async (employeeId: string) => {
     try {
       const res = await fetch(`/api/admin/employees/${employeeId}/status`, {
@@ -762,21 +780,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, error: result.error };
     } catch (e: any) {
       return { success: false, error: e.message };
-    }
-  };
-
-  // 17. Reset all data (Admin only)
-  const resetAllData = async () => {
-    try {
-      const res = await fetch('/api/system/reset-demo', {
-        method: 'POST',
-        headers: getAuthHeaders(),
-      });
-      if (res.ok) {
-        await refreshState();
-      }
-    } catch (e) {
-      console.error('Reset error:', e);
     }
   };
 
@@ -816,10 +819,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         markNotificationRead,
         markAllNotificationsRead,
         createEmployeeAccount,
+        createDepartment,
         toggleEmployeeStatus,
         updateDepartmentHead,
         refreshState,
-        resetAllData,
       }}
     >
       {children}
