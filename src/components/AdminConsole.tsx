@@ -22,6 +22,7 @@ export const AdminConsole: React.FC = () => {
     departments,
     auditLogs,
     createEmployeeAccount,
+    createDepartment,
     toggleEmployeeStatus,
     updateDepartmentHead,
   } = useApp();
@@ -32,8 +33,9 @@ export const AdminConsole: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
-  const [newDeptId, setNewDeptId] = useState(departments[0]?.id || 'dept-1');
+  const [newDeptId, setNewDeptId] = useState(departments[0]?.id || '');
   const [newRole, setNewRole] = useState<UserRole>('EMPLOYEE');
+  const [newDeptName, setNewDeptName] = useState('');
 
   // Audit Logs Filter
   const [logFilter, setLogFilter] = useState('');
@@ -60,7 +62,7 @@ export const AdminConsole: React.FC = () => {
     });
 
     if (res.success) {
-      showToast(`[${newName}] 직원 계정이 정상 발급되었습니다.`);
+      showToast(`[${newName}] 직원에게 계정 초대 메일을 발송했습니다. (72시간 내 비밀번호 설정)`);
       setShowAddModal(false);
       setNewName('');
       setNewEmail('');
@@ -241,6 +243,29 @@ export const AdminConsole: React.FC = () => {
 
       {/* Tab 2: Departments & Approver Roles */}
       {activeTab === 'departments' && (
+        <div className="space-y-4">
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const r = await createDepartment(newDeptName);
+            if (r.success) {
+              showToast(`[${newDeptName}] 부서를 등록했습니다.`);
+              setNewDeptName('');
+            } else alert(r.error || '부서 등록 실패');
+          }}
+          className="bg-white p-3 rounded-xl border border-slate-200 shadow-xs flex items-center gap-2 text-xs"
+        >
+          <input
+            value={newDeptName}
+            onChange={(e) => setNewDeptName(e.target.value)}
+            maxLength={60}
+            placeholder="새 부서명"
+            className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg w-56"
+          />
+          <button type="submit" className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-lg">
+            부서 등록
+          </button>
+        </form>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           {departments.map((dept) => {
             const head = employees.find((e) => e.id === dept.headEmployeeId);
@@ -268,9 +293,12 @@ export const AdminConsole: React.FC = () => {
                     onChange={(e) => updateDepartmentHead(dept.id, e.target.value)}
                     className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-900 font-semibold focus:outline-blue-500"
                   >
-                    {deptMembers.map((m) => (
+                    <option value="" disabled>
+                      부서장을 선택하세요
+                    </option>
+                    {deptMembers.filter((m) => m.role !== 'ADMIN' && m.status === 'ACTIVE').map((m) => (
                       <option key={m.id} value={m.id}>
-                        {m.name} ({m.email})
+                        {m.name}
                       </option>
                     ))}
                   </select>
@@ -299,6 +327,7 @@ export const AdminConsole: React.FC = () => {
               </div>
             );
           })}
+        </div>
         </div>
       )}
 

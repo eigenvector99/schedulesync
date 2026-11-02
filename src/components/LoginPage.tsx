@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   Calendar,
@@ -9,8 +9,6 @@ import {
   CheckCircle2,
   AlertCircle,
   KeyRound,
-  UserCheck,
-  ChevronDown,
 } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
@@ -19,8 +17,8 @@ export const LoginPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'login' | 'reset'>('login');
 
   // Form states
-  const [email, setEmail] = useState('a.kim@company.internal');
-  const [password, setPassword] = useState('kim123!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -31,17 +29,17 @@ export const LoginPage: React.FC = () => {
   const [newPassword, setNewPassword] = useState('');
   const [resetStep, setResetStep] = useState<1 | 2>(1);
 
-  // Quick Preset Selector helper
-  const [showPresets, setShowPresets] = useState(false);
-
-  const presets = [
-    { name: '김부서장 (허가권자 A)', email: 'a.kim@company.internal', pass: 'kim123!', role: '허가권자' },
-    { name: '이부서장 (허가권자 B)', email: 'b.lee@company.internal', pass: 'lee123!', role: '허가권자' },
-    { name: '총괄관리자 (Admin)', email: 'admin@company.internal', pass: 'admin123!', role: '관리자' },
-    { name: '박개발 (일반 직원)', email: 'park.dev@company.internal', pass: 'park123!', role: '직원' },
-    { name: '정엔지니어 (수락 대기 직원)', email: 'jung.eng@company.internal', pass: 'jung123!', role: '직원' },
-    { name: '강디자이너 (승인 대기 직원)', email: 'kang.des@company.internal', pass: 'kang123!', role: '직원' },
-  ];
+  // Opening the link from the reset / invitation e-mail (?resetToken=...) jumps straight to step 2.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tok = params.get('resetToken');
+    if (tok) {
+      setResetToken(tok);
+      setActiveTab('reset');
+      setResetStep(2);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,8 +63,7 @@ export const LoginPage: React.FC = () => {
     setLoading(false);
 
     if (res.success) {
-      setSuccessMsg('재설정 토큰이 발송되었습니다. (시스템 이메일 수신함 확인)');
-      if (res.token) setResetToken(res.token);
+      setSuccessMsg('등록된 이메일이라면 재설정 안내 메일이 발송됩니다. 메일의 토큰을 입력하세요.');
       setResetStep(2);
     } else {
       setErrorMsg(res.error || '재설정 요청 실패');
@@ -90,12 +87,6 @@ export const LoginPage: React.FC = () => {
     } else {
       setErrorMsg(res.error || '비밀번호 재설정 실패');
     }
-  };
-
-  const handleSelectPreset = (p: (typeof presets)[0]) => {
-    setEmail(p.email);
-    setPassword(p.pass);
-    setShowPresets(false);
   };
 
   return (
@@ -196,6 +187,7 @@ export const LoginPage: React.FC = () => {
                     type="password"
                     required
                     placeholder="••••••••"
+                    autoComplete="current-password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     className="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-lg text-slate-900 focus:outline-blue-500 text-xs"
@@ -212,40 +204,6 @@ export const LoginPage: React.FC = () => {
                 <ArrowRight className="w-4 h-4" />
               </button>
 
-              {/* Fast Account Selector for Testing / Convenience */}
-              <div className="pt-4 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setShowPresets(!showPresets)}
-                  className="w-full py-2 px-3 bg-slate-50 hover:bg-slate-100 rounded-lg text-slate-600 flex items-center justify-between font-medium text-[11px] transition-colors"
-                >
-                  <span className="flex items-center gap-1.5">
-                    <UserCheck className="w-3.5 h-3.5 text-blue-600" />
-                    <span>빠른 계정 선택 (초기 테스트 계정 목록)</span>
-                  </span>
-                  <ChevronDown className="w-3.5 h-3.5" />
-                </button>
-
-                {showPresets && (
-                  <div className="mt-2 divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden bg-slate-50 text-[11px]">
-                    {presets.map((p, idx) => (
-                      <div
-                        key={idx}
-                        onClick={() => handleSelectPreset(p)}
-                        className="p-2.5 hover:bg-white cursor-pointer flex items-center justify-between transition-colors"
-                      >
-                        <div>
-                          <span className="font-bold text-slate-900">{p.name}</span>
-                          <span className="text-slate-500 ml-2">({p.email})</span>
-                        </div>
-                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-200 text-slate-700 font-semibold">
-                          {p.role}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
             </form>
           )}
 
@@ -294,11 +252,11 @@ export const LoginPage: React.FC = () => {
                     />
                   </div>
                   <div>
-                    <label className="block font-semibold text-slate-700 mb-1">새 비밀번호 (6자 이상)</label>
+                    <label className="block font-semibold text-slate-700 mb-1">새 비밀번호 (10자 이상, 영문+숫자)</label>
                     <input
                       type="password"
                       required
-                      minLength={6}
+                      minLength={10}
                       placeholder="새 비밀번호 입력"
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
