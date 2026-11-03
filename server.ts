@@ -6,7 +6,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
-import nodemailer from 'nodemailer';
+import { deliver, notifyDM, verifySlack, DeliveryResult } from './server/notifier';
 import { checkEmployeeOverlap } from './src/utils/dateAndRrule';
 
 dotenv.config();
@@ -197,40 +197,20 @@ async function bootstrapAdmin() {
   console.log(`[bootstrap] 최초 관리자 계정을 생성했습니다: ${email}`);
 }
 
-// -------------------------------------------------------------
-// Outbound mail (SMTP). Without SMTP_HOST nothing is sent; in development the message is
-// printed to the server console, in production only the fact that it was skipped is logged.
-// -------------------------------------------------------------
-const mailTransport = process.env.SMTP_HOST
-  ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: parseInt(process.env.SMTP_PORT || '587', 10),
-      secure: process.env.SMTP_SECURE === 'true',
-      auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
-    })
-  : null;
-
-async function sendMail(to: string, subject: string, text: string): Promise<boolean> {
-  if (!mailTransport) {
-    if (isProduction) console.warn(`[mail] SMTP 미설정 - "${subject}" 발송 생략 (to: ${to})`);
-    else console.log(`[mail:dev] to=${to}\nsubject=${subject}\n${text}\n`);
-    return false;
-  }
-  try {
-    await mailTransport.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to, subject, text });
-    return true;
-  } catch (e) {
-    console.error(`[mail] 발송 실패 (to: ${to}, subject: ${subject}):`, e);
-    return false;
-  }
-}
-
 function appUrl(): string {
   return (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 }
 
-/** Issues a one-time token for password reset / account activation and mails it. */
-async function issueResetToken(user: UserRecord, ttlMinutes: number, kind: 'reset' | 'invite') {
+/**
+ * Issues a one-time token for password reset / account activation and delivers it
+ * (Slack DM, falling back to SMTP). Returns the link so an administrator can hand it over
+ * manually when delivery failed; callers must never expose it to anonymous requests.
+ */
+async function issueResetToken(
+  user: UserRecord,
+  ttlMinutes: number,
+  kind: 'reset' | 'invite'
+): Promise<{ link: string; delivery: DeliveryResult }> {
   const token = crypto.randomBytes(32).toString('hex');
   user.resetTokenHash = sha256(token);
   user.resetTokenExpiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
@@ -241,8 +221,9 @@ async function issueResetToken(user: UserRecord, ttlMinutes: number, kind: 'rese
   const body =
     kind === 'invite'
       ? `${user.name}님,\n\nScheduleSync 계정이 발급되었습니다. 아래 링크에서 비밀번호를 설정하면 사용할 수 있습니다. (${Math.round(ttlMinutes / 60)}시간 내 1회 사용 가능)\n\n${link}\n\n토큰: ${token}`
-      : `${user.name}님,\n\n비밀번호 재설정을 요청하셨습니다. 아래 링크에서 새 비밀번호를 설정하세요. (${ttlMinutes}분 내 1회 사용 가능)\n\n${link}\n\n토큰: ${token}\n\n요청하지 않으셨다면 이 메일을 무시하셔도 됩니다.`;
-  await sendMail(user.email, subject, body);
+      : `${user.name}님,\n\n비밀번호 재설정을 요청하셨습니다. 아래 링크에서 새 비밀번호를 설정하세요. (${ttlMinutes}분 내 1회 사용 가능)\n\n${link}\n\n토큰: ${token}\n\n요청하지 않으셨다면 이 메시지를 무시하셔도 됩니다.`;
+  const delivery = await deliver(user.email, subject, body);
+  return { link, delivery };
 }
 
 // -------------------------------------------------------------
@@ -645,6 +626,9 @@ function notify(recipientId: string, type: string, title: string, message: strin
     linkTab,
     createdAt: new Date().toISOString(),
   });
+  // Mirror to Slack so people do not have to open the app to learn that something awaits them.
+  const recipient = db.users.find((u) => u.id === recipientId);
+  if (recipient?.status === 'ACTIVE') notifyDM(recipient.email, title, message);
 }
 
 // 8. Projects: Create Project (Approver only)
@@ -1154,10 +1138,42 @@ app.post('/api/admin/employees', authMiddleware, async (req: AuthenticatedReques
     passwordIter: PBKDF2_ITER,
   };
   db.users.push(newEmp);
-  await issueResetToken(newEmp, 72 * 60, 'invite');
+  const { link, delivery } = await issueResetToken(newEmp, 72 * 60, 'invite');
 
-  logAudit(user, 'CREATE_EMPLOYEE', 'EMPLOYEE', newEmp.id, `신규 직원 [${name} (${email})] 초대 발송`);
-  res.json({ success: true, employee: publicUser(newEmp, user) });
+  logAudit(user, 'CREATE_EMPLOYEE', 'EMPLOYEE', newEmp.id, `신규 직원 [${name} (${email})] 초대 (${delivery.ok ? delivery.channel : '발송 실패'})`);
+  res.json({
+    success: true,
+    employee: publicUser(newEmp, user),
+    delivered: delivery.ok,
+    deliveryError: delivery.ok ? undefined : delivery.error,
+    // Only when automatic delivery failed: lets the administrator pass the link on personally.
+    inviteLink: delivery.ok ? undefined : link,
+  });
+});
+
+// 17-b. Admin: (Re)send an invitation or password-reset link
+app.post('/api/admin/employees/:id/invite', authMiddleware, async (req: AuthenticatedRequest, res) => {
+  const user = req.user!;
+  if (user.role !== 'ADMIN') return res.status(403).json({ error: '시스템 관리자만 사용할 수 있습니다.' });
+  const target = db.users.find((u) => u.id === req.params.id);
+  if (!target) return res.status(404).json({ error: '직원을 찾을 수 없습니다.' });
+  if (target.status === 'DISABLED') return res.status(400).json({ error: '비활성화된 계정입니다.' });
+
+  const kind = target.status === 'INVITED' ? 'invite' : 'reset';
+  const { link, delivery } = await issueResetToken(target, kind === 'invite' ? 72 * 60 : 30, kind);
+  logAudit(
+    user,
+    kind === 'invite' ? 'RESEND_INVITE' : 'ADMIN_RESET_LINK',
+    'EMPLOYEE',
+    target.id,
+    `[${target.name}] ${kind === 'invite' ? '초대' : '비밀번호 재설정'} 링크 발급 (${delivery.ok ? delivery.channel : '자동 발송 실패 - 수동 전달'})`
+  );
+  res.json({
+    success: true,
+    delivered: delivery.ok,
+    deliveryError: delivery.ok ? undefined : delivery.error,
+    inviteLink: delivery.ok ? undefined : link,
+  });
 });
 
 // 18. Admin: Toggle Employee Status (Active / Disabled)
@@ -1229,6 +1245,7 @@ app.patch('/api/admin/departments/:id/head', authMiddleware, (req: Authenticated
 // -------------------------------------------------------------
 async function startServer() {
   await bootstrapAdmin();
+  await verifySlack();
   if (!isProduction) {
     // Development mode with Vite Middleware
     const vite = await createViteServer({

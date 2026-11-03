@@ -14,6 +14,15 @@ import {
 } from '../types';
 import { checkEmployeeOverlap } from '../utils/dateAndRrule';
 
+/** Result of issuing an invitation / reset link. `inviteLink` is only present when automatic delivery failed. */
+export interface InviteResult {
+  success: boolean;
+  error?: string;
+  delivered?: boolean;
+  deliveryError?: string;
+  inviteLink?: string;
+}
+
 interface AppContextType {
   // Auth state
   isAuthenticated: boolean;
@@ -107,7 +116,8 @@ interface AppContextType {
   // Admin actions
   createEmployeeAccount: (
     data: Omit<Employee, 'id' | 'status' | 'failedLoginCount'>
-  ) => Promise<{ success: boolean; error?: string }>;
+  ) => Promise<InviteResult>;
+  resendInvite: (employeeId: string) => Promise<InviteResult>;
   createDepartment: (name: string) => Promise<{ success: boolean; error?: string }>;
   toggleEmployeeStatus: (employeeId: string) => Promise<{ success: boolean; error?: string }>;
   updateDepartmentHead: (departmentId: string, headEmployeeId: string) => Promise<{ success: boolean; error?: string }>;
@@ -712,7 +722,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // 16. Admin methods
   const createEmployeeAccount = async (
     data: Omit<Employee, 'id' | 'status' | 'failedLoginCount'>
-  ) => {
+  ): Promise<InviteResult> => {
     try {
       const res = await fetch('/api/admin/employees', {
         method: 'POST',
@@ -722,7 +732,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const result = await res.json();
       if (res.ok) {
         await refreshState();
-        return { success: true };
+        return {
+          success: true,
+          delivered: result.delivered,
+          deliveryError: result.deliveryError,
+          inviteLink: result.inviteLink,
+        };
+      }
+      return { success: false, error: result.error };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  };
+
+  const resendInvite = async (employeeId: string): Promise<InviteResult> => {
+    try {
+      const res = await fetch(`/api/admin/employees/${employeeId}/invite`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      const result = await res.json();
+      if (res.ok) {
+        await refreshState();
+        return {
+          success: true,
+          delivered: result.delivered,
+          deliveryError: result.deliveryError,
+          inviteLink: result.inviteLink,
+        };
       }
       return { success: false, error: result.error };
     } catch (e: any) {
@@ -819,6 +856,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         markNotificationRead,
         markAllNotificationsRead,
         createEmployeeAccount,
+        resendInvite,
         createDepartment,
         toggleEmployeeStatus,
         updateDepartmentHead,

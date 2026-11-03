@@ -22,6 +22,7 @@ export const AdminConsole: React.FC = () => {
     departments,
     auditLogs,
     createEmployeeAccount,
+    resendInvite,
     createDepartment,
     toggleEmployeeStatus,
     updateDepartmentHead,
@@ -36,6 +37,8 @@ export const AdminConsole: React.FC = () => {
   const [newDeptId, setNewDeptId] = useState(departments[0]?.id || '');
   const [newRole, setNewRole] = useState<UserRole>('EMPLOYEE');
   const [newDeptName, setNewDeptName] = useState('');
+  // Shown when Slack/SMTP delivery failed so the administrator can pass the link on personally.
+  const [manualLink, setManualLink] = useState<{ name: string; link: string; reason?: string } | null>(null);
 
   // Audit Logs Filter
   const [logFilter, setLogFilter] = useState('');
@@ -62,7 +65,8 @@ export const AdminConsole: React.FC = () => {
     });
 
     if (res.success) {
-      showToast(`[${newName}] 직원에게 계정 초대 메일을 발송했습니다. (72시간 내 비밀번호 설정)`);
+      if (res.delivered) showToast(`[${newName}] 님에게 Slack DM으로 계정 초대를 보냈습니다. (72시간 내 비밀번호 설정)`);
+      else if (res.inviteLink) setManualLink({ name: newName, link: res.inviteLink, reason: res.deliveryError });
       setShowAddModal(false);
       setNewName('');
       setNewEmail('');
@@ -88,6 +92,29 @@ export const AdminConsole: React.FC = () => {
         <div className="fixed bottom-6 right-6 z-50 px-4 py-3 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl shadow-lg text-xs font-semibold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
           <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {manualLink && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-xs space-y-2">
+          <p className="font-bold text-amber-900">
+            [{manualLink.name}] 님에게 자동 발송하지 못했습니다{manualLink.reason ? ` (${manualLink.reason})` : ''}.
+          </p>
+          <p className="text-amber-800">
+            아래 링크를 본인에게 직접 전달하세요. 1회용이며 이 창을 닫으면 다시 볼 수 없습니다. (발급 사실은 감사 로그에 기록됩니다)
+          </p>
+          <div className="flex gap-2">
+            <input readOnly value={manualLink.link} onFocus={(e) => e.currentTarget.select()} className="flex-1 px-2 py-1.5 border border-amber-300 rounded bg-white font-mono" />
+            <button
+              onClick={() => navigator.clipboard?.writeText(manualLink.link)}
+              className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded"
+            >
+              복사
+            </button>
+            <button onClick={() => setManualLink(null)} className="px-3 py-1.5 border border-amber-300 rounded text-amber-900">
+              닫기
+            </button>
+          </div>
         </div>
       )}
 
@@ -172,6 +199,7 @@ export const AdminConsole: React.FC = () => {
                 {employees.map((emp) => {
                   const dept = departments.find((d) => d.id === emp.departmentId)?.name;
                   const isActive = emp.status === 'ACTIVE';
+                  const isInvited = emp.status === 'INVITED';
 
                   return (
                     <tr key={emp.id} className="hover:bg-slate-50 transition-colors">
@@ -215,11 +243,24 @@ export const AdminConsole: React.FC = () => {
                               isActive ? 'bg-emerald-500' : 'bg-slate-300'
                             }`}
                           ></span>
-                          {isActive ? '활성 (ACTIVE)' : '비활성 (DISABLED)'}
+                          {isActive ? '활성 (ACTIVE)' : isInvited ? '초대 대기 (INVITED)' : '비활성 (DISABLED)'}
                         </span>
                       </td>
                       <td className="p-3 text-right">
-                        {emp.role !== 'ADMIN' && (
+                        {isInvited && (
+                          <button
+                            onClick={async () => {
+                              const r = await resendInvite(emp.id);
+                              if (!r.success) alert(r.error || '초대 재발송 실패');
+                              else if (r.delivered) showToast(`[${emp.name}] 님에게 초대를 다시 보냈습니다.`);
+                              else if (r.inviteLink) setManualLink({ name: emp.name, link: r.inviteLink, reason: r.deliveryError });
+                            }}
+                            className="px-2.5 py-1 rounded text-[11px] font-medium border border-blue-200 text-blue-700 hover:bg-blue-50 transition-colors cursor-pointer"
+                          >
+                            초대 재발송
+                          </button>
+                        )}
+                        {emp.role !== 'ADMIN' && !isInvited && (
                           <button
                             onClick={() => toggleEmployeeStatus(emp.id)}
                             className={`px-2.5 py-1 rounded text-[11px] font-medium border transition-colors cursor-pointer ${

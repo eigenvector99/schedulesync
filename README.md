@@ -23,7 +23,9 @@ npm run dev               # http://localhost:3000
 |---|---|---|
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | 첫 실행 | 최초 관리자 계정 (`ADMIN_NAME` 선택) |
 | `APP_URL` | 운영 | 초대/재설정 메일의 링크 기준 주소 |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` | 운영 | 메일 발송. **미설정 시 초대·비밀번호 재설정 메일이 나가지 않는다** (개발 모드에서는 서버 콘솔에 출력) |
+| `SLACK_BOT_TOKEN` | 운영(권장) | Slack DM 발송용 Bot 토큰(`xoxb-…`). 아래 "Slack 알림" 참고 |
+| `SLACK_NOTIFY_EVENTS` | 선택 | `false`면 업무 알림은 보내지 않고 초대/재설정 링크만 DM으로 발송 |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` | 선택 | Slack 미설정/실패 시 대체 발송 수단 |
 | `DATA_DIR` | 선택 | `database.json` 위치 (기본 `./data`). git 밖에 두고 백업할 것 |
 | `PORT` | 선택 | 기본 3000 |
 | `TRUST_PROXY` | 선택 | 리버스 프록시 뒤에서 `true` (로그인 시도 제한이 실제 클라이언트 IP 기준이 되도록) |
@@ -37,9 +39,24 @@ npm start        # NODE_ENV=production
 
 HTTPS 종단(리버스 프록시/로드밸런서)은 별도로 구성해야 합니다.
 
+> **GitHub Pages만으로는 배포할 수 없습니다.** Pages는 정적 파일만 서빙하므로 API 서버(`server.ts`)를 실행할 수 없습니다. 화면과 API를 한 서버에서 함께 서빙하는 PaaS(Render, Railway, Fly.io 등)를 권장하며, 현재 JSON 파일 저장소는 **재시작 후에도 유지되는 디스크(볼륨)**와 **인스턴스 1개**가 필요합니다.
+
+## Slack 알림
+
+초대·비밀번호 재설정 링크와 업무 알림(배정 요청, 승인 요청, 반려, 일정 변경 등)을 Slack DM으로 보냅니다.
+
+1. https://api.slack.com/apps 에서 앱 생성 → **OAuth & Permissions → Bot Token Scopes**에 `chat:write`, `users:read.email` 추가
+2. **Install to Workspace** 후 *Bot User OAuth Token*(`xoxb-…`)을 서버 환경변수 `SLACK_BOT_TOKEN`에 설정
+3. 직원의 **ScheduleSync 이메일 = Slack 계정 이메일**이어야 합니다(이메일로 사용자를 찾음). 서버 시작 시 토큰을 검증해 로그에 결과를 남깁니다.
+
+- 발송 순서: Slack DM → (실패/미설정 시) SMTP → (개발 모드) 서버 콘솔
+- Slack에서 사용자를 찾지 못하는 등 자동 발송에 실패하면 관리자 화면에 **1회용 링크**가 표시되어 직접 전달할 수 있습니다(감사 로그에 기록). 초대 대기 중인 직원은 *초대 재발송*으로 새 링크를 보낼 수 있고 이전 링크는 무효가 됩니다.
+- 업무 알림 DM은 부가 기능입니다. 실패해도 업무 처리는 영향받지 않고 앱 내 알림함에는 그대로 쌓입니다.
+- 토큰은 서버에만 두세요. 프런트(예: GitHub Pages)에 넣으면 누구나 볼 수 있습니다.
+
 ## 계정 흐름
 
-- 관리자가 직원을 등록하면 **초대 메일**(72시간, 1회용 링크)이 발송되고, 직원이 비밀번호를 직접 설정하면 활성화됩니다.
+- 관리자가 직원을 등록하면 **초대 DM**(72시간, 1회용 링크)이 발송되고, 직원이 비밀번호를 직접 설정하면 활성화됩니다.
 - 비밀번호 재설정 링크는 30분, 1회용입니다. 존재하지 않는 이메일에도 동일하게 응답합니다.
 - 비밀번호 변경/재설정/계정 비활성화 시 기존 세션은 모두 종료됩니다.
 
