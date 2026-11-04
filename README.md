@@ -23,6 +23,7 @@ npm run dev               # http://localhost:3000
 |---|---|---|
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | 첫 실행 | 최초 관리자 계정 (`ADMIN_NAME` 선택) |
 | `APP_URL` | 운영 | 초대/재설정 메일의 링크 기준 주소 |
+| `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_TEAM_ID` | 선택(권장) | Slack 로그인(SSO). 설정하면 일반 직원은 Slack으로만 로그인합니다. 아래 "Slack 로그인" 참고 |
 | `SLACK_BOT_TOKEN` | 운영(권장) | Slack DM 발송용 Bot 토큰(`xoxb-…`). 아래 "Slack 알림" 참고 |
 | `SLACK_NOTIFY_EVENTS` | 선택 | `false`면 업무 알림은 보내지 않고 초대/재설정 링크만 DM으로 발송 |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` | 선택 | Slack 미설정/실패 시 대체 발송 수단 |
@@ -66,6 +67,21 @@ HTTPS 종단(리버스 프록시/로드밸런서)은 별도로 구성해야 합�
 - Slack에서 사용자를 찾지 못하는 등 자동 발송에 실패하면 관리자 화면에 **1회용 링크**가 표시되어 직접 전달할 수 있습니다(감사 로그에 기록). 초대 대기 중인 직원은 *초대 재발송*으로 새 링크를 보낼 수 있고 이전 링크는 무효가 됩니다.
 - 업무 알림 DM은 부가 기능입니다. 실패해도 업무 처리는 영향받지 않고 앱 내 알림함에는 그대로 쌓입니다.
 - 토큰은 서버에만 두세요. 프런트(예: GitHub Pages)에 넣으면 누구나 볼 수 있습니다.
+
+## Slack 로그인 (SSO)
+
+`SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`을 설정하면 로그인 화면에 **Slack으로 로그인**이 나타납니다(OpenID Connect, 인가 코드 방식).
+
+1. Slack 앱의 *OpenID Connect* 설정에서 **Redirect URL**을 등록합니다: `<APP_URL>/api/auth/slack/callback` (개발: `http://localhost:3000/api/auth/slack/callback`). 주소가 정해지면 Slack 앱과 `APP_URL`만 바꾸면 됩니다.
+2. *Basic Information*의 Client ID/Secret을 환경변수에 넣고, 가능하면 `SLACK_TEAM_ID`로 워크스페이스를 제한합니다.
+3. 직원 계정은 이전처럼 **관리자가 먼저 등록**합니다. Slack 이메일과 같은 이메일로 매칭되며, 등록되지 않은 사람은 로그인할 수 없고 시도는 감사 로그(`SSO_LOGIN_REJECTED`)에 남습니다.
+
+동작 방식
+- 초대 대기 계정은 첫 Slack 로그인에서 자동으로 활성화됩니다. 초대 DM은 비밀번호 링크 대신 "Slack으로 로그인하세요" 안내만 보냅니다.
+- 첫 로그인 때 계정이 그 Slack 사용자 ID에 **묶입니다**. 이후 같은 이메일을 다른 Slack 사람이 쓰면(주소 재사용) 거부됩니다.
+- **비밀번호 로그인은 관리자 전용 비상 수단**입니다. 일반 직원은 비밀번호가 맞아도 거부되고, 로그인 화면에서도 "관리자 비상 로그인"을 눌러야 입력 폼이 보입니다. Slack 장애 시 관리자는 이 경로로 들어와 계정과 설정을 관리할 수 있습니다.
+- 보안: `state`는 1회용이며 시작한 브라우저의 쿠키에 묶입니다(로그인 CSRF 방지). `nonce`, 발급자, 대상(audience), 만료, 이메일 인증, 워크스페이스를 검증하고, 로그인 결과는 1회용 60초 코드로만 프런트에 전달됩니다(URL에 세션 토큰 없음).
+- `SLACK_CLIENT_ID`가 없으면 이전처럼 모든 계정이 비밀번호로 로그인합니다.
 
 ## 일정 변경 요청의 재검증
 

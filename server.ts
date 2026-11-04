@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 import { deliver, notifyDM, verifySlack, DeliveryResult } from './server/notifier';
 import { openDb, migrate, Db, Queryable } from './server/db';
+import { ssoEnabled, buildAuthorizeUrl, exchangeCodeForIdentity, SsoError } from './server/slack-sso';
 import {
   UserRecord,
   mapUser,
@@ -207,10 +208,18 @@ async function bootstrapAdmin() {
  * manually when delivery failed; callers must never expose it to anonymous requests.
  */
 async function issueResetToken(
-  user: Pick<UserRecord, 'id' | 'name' | 'email'>,
+  user: Pick<UserRecord, 'id' | 'name' | 'email' | 'role'>,
   ttlMinutes: number,
   kind: 'reset' | 'invite'
 ): Promise<{ link: string; delivery: DeliveryResult }> {
+  // With Slack sign-in only administrators have a password; everybody else just needs to know where to sign in.
+  if (ssoEnabled() && user.role !== 'ADMIN') {
+    const link = appUrl();
+    const subject = kind === 'invite' ? '[ScheduleSync] 계정이 발급되었습니다' : '[ScheduleSync] 로그인 안내';
+    const body = `${user.name}님,\n\n${kind === 'invite' ? 'ScheduleSync 계정이 발급되었습니다.' : 'ScheduleSync는 Slack 계정으로 로그인합니다.'} 아래 주소에서 "Slack으로 로그인"을 누르세요. 별도의 비밀번호는 필요하지 않습니다.\n\n${link}`;
+    return { link, delivery: await deliver(user.email, subject, body) };
+  }
+
   const token = crypto.randomBytes(32).toString('hex');
   await db.query(`UPDATE users SET reset_token_hash = $2, reset_token_expires_at = now() + make_interval(mins => $3::int) WHERE id = $1`, [
     user.id,
@@ -286,6 +295,13 @@ app.get('/api/health', route(async (_req, res) => {
 }));
 
 // 1. Auth: Login
+/** Creates a 7-day app session and returns the bearer token (only its hash is stored). */
+async function issueSession(q: Queryable, userId: string): Promise<string> {
+  const token = `tok_${crypto.randomBytes(32).toString('hex')}`;
+  await q.query(`INSERT INTO auth_tokens (token_hash, user_id, expires_at) VALUES ($1,$2, now() + interval '7 days')`, [sha256(token), userId]);
+  return token;
+}
+
 const LOGIN_ERROR = '이메일 또는 비밀번호가 올바르지 않습니다.';
 const DUMMY_SALT = generateSalt();
 
@@ -311,8 +327,10 @@ app.post('/api/auth/login', route(async (req, res) => {
 
   if (!user || !safeEqualHex(computedHash, user.passwordHash)) throw fail(401, LOGIN_ERROR);
   if (user.status === 'DISABLED') throw fail(403, '비활성화된 계정입니다. 관리자에게 문의하세요.');
+  // With Slack sign-in enabled, passwords are an emergency door for administrators only.
+  if (ssoEnabled() && user.role !== 'ADMIN') throw fail(403, 'Slack으로 로그인해 주세요. (비밀번호 로그인은 관리자 전용입니다.)');
   if (user.status !== 'ACTIVE') {
-    throw fail(403, '아직 활성화되지 않은 계정입니다. 초대 메시지의 링크로 비밀번호를 설정하세요.');
+    throw fail(403, '아직 활성화되지 않은 계정입니다. 초대 메시지의 안내에 따라 설정하세요.');
   }
 
   // Transparently upgrade legacy hashes to the current work factor.
@@ -322,8 +340,7 @@ app.post('/api/auth/login', route(async (req, res) => {
     upgrade = { salt, hash: await hashPassword(password, salt) };
   }
 
-  const token = `tok_${crypto.randomBytes(32).toString('hex')}`;
-  await transact(async ({ q }) => {
+  const token = await transact(async ({ q }) => {
     if (upgrade) {
       await q.query(`UPDATE users SET password_salt = $2, password_hash = $3, password_iter = $4 WHERE id = $1`, [
         user.id,
@@ -332,11 +349,122 @@ app.post('/api/auth/login', route(async (req, res) => {
         PBKDF2_ITER,
       ]);
     }
-    await q.query(`INSERT INTO auth_tokens (token_hash, user_id, expires_at) VALUES ($1,$2, now() + interval '7 days')`, [sha256(token), user.id]);
+    const t = await issueSession(q, user.id);
     await logAudit(q, user, 'USER_LOGIN', 'EMPLOYEE', user.id, `로그인 성공 (${user.email})`);
+    return t;
   });
 
   res.json({ token, user: publicUser(user, user) });
+}));
+
+// 1-b. Sign in with Slack
+app.get('/api/auth/config', (_req, res) => {
+  res.json({ slack: { enabled: ssoEnabled() }, passwordLogin: ssoEnabled() ? 'admin-only' : 'all' });
+});
+
+const OAUTH_COOKIE = 'ss_oauth';
+const cookieSecure = () => isProduction || appUrl().startsWith('https://');
+const readCookie = (req: Request, name: string): string | undefined =>
+  req.headers.cookie
+    ?.split(';')
+    .map((c) => c.trim())
+    .find((c) => c.startsWith(`${name}=`))
+    ?.slice(name.length + 1);
+const setOauthCookie = (res: Response, value: string, maxAge: number) =>
+  res.setHeader('Set-Cookie', `${OAUTH_COOKIE}=${value}; HttpOnly; SameSite=Lax; Path=/api/auth/slack; Max-Age=${maxAge}${cookieSecure() ? '; Secure' : ''}`);
+
+app.get('/api/auth/slack/login', route(async (req, res) => {
+  if (!ssoEnabled()) throw fail(404, 'Slack 로그인이 설정되지 않았습니다.');
+  if (rateLimited(`sso:start:${req.ip}`, 60, 10 * 60_000)) throw fail(429, '시도가 너무 많습니다. 잠시 후 다시 시도하세요.');
+
+  const state = crypto.randomBytes(24).toString('hex');
+  const nonce = crypto.randomBytes(24).toString('hex');
+  const binding = crypto.randomBytes(24).toString('hex');
+  await db.query(`INSERT INTO oauth_states (state_hash, binding_hash, nonce, expires_at) VALUES ($1,$2,$3, now() + interval '10 minutes')`, [
+    sha256(state),
+    sha256(binding),
+    nonce,
+  ]);
+  setOauthCookie(res, binding, 600);
+  res.redirect(302, buildAuthorizeUrl({ state, nonce, appUrl: appUrl() }));
+}));
+
+app.get('/api/auth/slack/callback', route(async (req, res) => {
+  const bounce = (code: string, user?: Pick<UserRecord, 'id' | 'name'>, detail = '') => {
+    setOauthCookie(res, '', 0);
+    // Rejections are written to the audit log so administrators can see who tried and why.
+    const log = detail ? logAudit(db, user, 'SSO_LOGIN_REJECTED', 'EMPLOYEE', user?.id ?? 'unknown', `${code}: ${detail}`) : Promise.resolve();
+    return log.catch(() => undefined).then(() => res.redirect(302, `/?ssoError=${encodeURIComponent(code)}`));
+  };
+
+  if (!ssoEnabled()) throw fail(404, 'Slack 로그인이 설정되지 않았습니다.');
+  if (rateLimited(`sso:cb:${req.ip}`, 60, 10 * 60_000)) return bounce('rate_limited');
+  if (typeof req.query.error === 'string') return bounce('denied');
+  const { code, state } = req.query;
+  const binding = readCookie(req, OAUTH_COOKIE);
+  if (typeof code !== 'string' || typeof state !== 'string' || !binding) return bounce('invalid_state');
+
+  // The state is single-use and must come back in the same browser that started the flow.
+  const pending = (
+    await db.query(`DELETE FROM oauth_states WHERE state_hash = $1 AND expires_at > now() RETURNING binding_hash, nonce`, [sha256(state)])
+  ).rows[0];
+  if (!pending || !safeEqualHex(pending.binding_hash, sha256(binding))) return bounce('invalid_state');
+
+  let identity;
+  try {
+    identity = await exchangeCodeForIdentity(code, pending.nonce, appUrl());
+  } catch (e) {
+    if (e instanceof SsoError) return bounce(e.code === 'slack_unreachable' ? 'slack_unreachable' : e.code, undefined, e.code === 'wrong_workspace' ? 'workspace mismatch' : '');
+    throw e;
+  }
+
+  const loginCode = crypto.randomBytes(24).toString('hex');
+  const outcome = await transact(async ({ q }) => {
+    const found = await q.query(`SELECT * FROM users WHERE lower(email) = lower($1) FOR UPDATE`, [identity.email]);
+    if (!found.rows[0]) return { error: 'not_registered' as const, detail: identity.email };
+    const user = mapUser(found.rows[0]);
+    if (user.status === 'DISABLED') return { error: 'disabled' as const, user, detail: identity.email };
+    // The Slack identity is bound on first use: a recycled e-mail address must not inherit an existing account.
+    if (user.slackUserId && user.slackUserId !== identity.slackUserId) return { error: 'identity_mismatch' as const, user, detail: identity.email };
+
+    try {
+      await q.query(`SAVEPOINT bind`);
+      await q.query(`UPDATE users SET slack_user_id = $2 WHERE id = $1`, [user.id, identity.slackUserId]);
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+      await q.query(`ROLLBACK TO SAVEPOINT bind`);
+      return { error: 'identity_mismatch' as const, user, detail: `${identity.email} (Slack id already bound to another account)` };
+    }
+    const activated = user.status === 'INVITED';
+    if (activated) {
+      await q.query(`UPDATE users SET status = 'ACTIVE', reset_token_hash = NULL, reset_token_expires_at = NULL WHERE id = $1`, [user.id]);
+    }
+    await q.query(`INSERT INTO login_codes (code_hash, user_id, expires_at) VALUES ($1,$2, now() + interval '60 seconds')`, [sha256(loginCode), user.id]);
+    await logAudit(q, user, activated ? 'SLACK_LOGIN_ACTIVATED' : 'SLACK_LOGIN', 'EMPLOYEE', user.id, `Slack 로그인 (${user.email})${activated ? ' - 초대 계정 활성화' : ''}`);
+    return { error: null, user };
+  });
+
+  if (outcome.error) return bounce(outcome.error, outcome.user, outcome.detail);
+  setOauthCookie(res, '', 0);
+  res.redirect(302, `/?ssoCode=${loginCode}`);
+}));
+
+// Hands the finished Slack login to the single-page app: one use, 60 seconds, never a token in a URL.
+app.post('/api/auth/slack/exchange', route(async (req, res) => {
+  const code = req.body?.code;
+  if (typeof code !== 'string' || !code) throw fail(400, '로그인 코드가 필요합니다.');
+  if (rateLimited(`sso:ex:${req.ip}`, 60, 10 * 60_000)) throw fail(429, '시도가 너무 많습니다. 잠시 후 다시 시도하세요.');
+
+  const result = await transact(async ({ q }) => {
+    const row = (await q.query(`DELETE FROM login_codes WHERE code_hash = $1 AND expires_at > now() RETURNING user_id`, [sha256(code)])).rows[0];
+    if (!row) return null;
+    const u = (await q.query(`SELECT * FROM users WHERE id = $1`, [row.user_id])).rows[0];
+    if (!u || u.status !== 'ACTIVE') return null;
+    const user = mapUser(u);
+    return { token: await issueSession(q, user.id), user };
+  });
+  if (!result) throw fail(401, '로그인 코드가 만료되었거나 이미 사용되었습니다. 다시 시도해 주세요.');
+  res.json({ token: result.token, user: publicUser(result.user, result.user) });
 }));
 
 // 2. Auth: Get Current User (Me)
@@ -1208,7 +1336,7 @@ app.post('/api/admin/employees', authMiddleware, route(async (req, res) => {
     throw e;
   });
 
-  const { link, delivery } = await issueResetToken({ id, name, email }, 72 * 60, 'invite');
+  const { link, delivery } = await issueResetToken({ id, name, email, role }, 72 * 60, 'invite');
   await logAudit(db, user, delivery.ok ? 'INVITE_SENT' : 'INVITE_DELIVERY_FAILED', 'EMPLOYEE', id, `[${name}] 초대 ${delivery.ok ? `발송 (${delivery.channel})` : '발송 실패 - 관리자가 링크를 직접 전달해야 함'}`);
 
   const created = mapUser((await db.query(`SELECT * FROM users WHERE id = $1`, [id])).rows[0]);
@@ -1337,7 +1465,9 @@ async function startServer() {
   setInterval(() => {
     const now = Date.now();
     for (const [k, b] of rateBuckets) if (b.resetAt <= now) rateBuckets.delete(k);
-    db.query(`DELETE FROM auth_tokens WHERE expires_at < now()`).catch((e) => console.error('[db] token purge failed:', e.message));
+    for (const t of ['auth_tokens', 'oauth_states', 'login_codes']) {
+      db.query(`DELETE FROM ${t} WHERE expires_at < now()`).catch((e) => console.error(`[db] ${t} purge failed:`, e.message));
+    }
   }, 10 * 60_000).unref();
 
   if (!isProduction) {

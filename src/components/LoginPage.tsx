@@ -11,10 +11,28 @@ import {
   KeyRound,
 } from 'lucide-react';
 
+const SSO_ERRORS: Record<string, string> = {
+  not_registered: '이 Slack 계정의 이메일로 등록된 사용자가 없습니다. 관리자에게 계정 등록을 요청하세요.',
+  disabled: '비활성화된 계정입니다. 관리자에게 문의하세요.',
+  identity_mismatch: '이 이메일에 이미 다른 Slack 계정이 연결되어 있습니다. 관리자에게 문의하세요.',
+  wrong_workspace: '허용된 Slack 워크스페이스의 계정이 아닙니다.',
+  email_unverified: 'Slack 계정의 이메일이 인증되지 않았습니다.',
+  no_email: 'Slack 계정에서 이메일을 확인할 수 없습니다.',
+  denied: 'Slack 로그인이 취소되었습니다.',
+  invalid_state: '로그인 요청이 만료되었거나 유효하지 않습니다. 처음부터 다시 시도해 주세요.',
+  rate_limited: '시도가 너무 많습니다. 잠시 후 다시 시도하세요.',
+  slack_unreachable: 'Slack에 연결할 수 없습니다. 잠시 후 다시 시도하거나 관리자 로그인을 이용하세요.',
+};
+
 export const LoginPage: React.FC = () => {
-  const { login, requestPasswordReset, confirmPasswordReset } = useApp();
+  const { login, completeSsoLogin, requestPasswordReset, confirmPasswordReset } = useApp();
 
   const [activeTab, setActiveTab] = useState<'login' | 'reset'>('login');
+
+  // Sign in with Slack: when enabled it is the normal way in, passwords are an emergency door for administrators.
+  const [ssoEnabled, setSsoEnabled] = useState(false);
+  const [showAdminLogin, setShowAdminLogin] = useState(false);
+  const passwordUi = !ssoEnabled || showAdminLogin;
 
   // Form states
   const [email, setEmail] = useState('');
@@ -28,6 +46,31 @@ export const LoginPage: React.FC = () => {
   const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [resetStep, setResetStep] = useState<1 | 2>(1);
+
+  useEffect(() => {
+    fetch('/api/auth/config')
+      .then((r) => r.json())
+      .then((c) => setSsoEnabled(!!c?.slack?.enabled))
+      .catch(() => undefined);
+  }, []);
+
+  // Back from Slack: ?ssoCode=... finishes the login, ?ssoError=... explains why it did not work.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ssoCode = params.get('ssoCode');
+    const ssoError = params.get('ssoError');
+    if (!ssoCode && !ssoError) return;
+    window.history.replaceState({}, '', window.location.pathname);
+    if (ssoError) {
+      setErrorMsg(SSO_ERRORS[ssoError] || 'Slack 로그인에 실패했습니다. 다시 시도해 주세요.');
+    } else if (ssoCode) {
+      setLoading(true);
+      completeSsoLogin(ssoCode).then((r) => {
+        setLoading(false);
+        if (!r.success) setErrorMsg(r.error || 'Slack 로그인에 실패했습니다.');
+      });
+    }
+  }, []);
 
   // Opening the link from the reset / invitation e-mail (?resetToken=...) jumps straight to step 2.
   useEffect(() => {
@@ -105,7 +148,28 @@ export const LoginPage: React.FC = () => {
 
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md px-4">
         <div className="bg-white py-8 px-6 sm:px-8 shadow-2xl rounded-2xl border border-slate-200">
+          {ssoEnabled && (
+            <div className="mb-6 space-y-3 text-center">
+              <a
+                href="/api/auth/slack/login"
+                className="w-full py-3 px-4 bg-[#4A154B] hover:bg-[#3b1030] text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2 text-sm"
+              >
+                <span>Slack으로 로그인</span>
+                <ArrowRight className="w-4 h-4" />
+              </a>
+              <p className="text-[11px] text-slate-500">회사 Slack 계정으로 로그인합니다. 별도 비밀번호는 필요하지 않습니다.</p>
+              <button
+                type="button"
+                onClick={() => setShowAdminLogin(!showAdminLogin)}
+                className="text-[11px] text-slate-400 hover:text-slate-600 underline"
+              >
+                {showAdminLogin ? '관리자 로그인 닫기' : '관리자 비상 로그인 (Slack 장애 시)'}
+              </button>
+            </div>
+          )}
+
           {/* Tabs */}
+          {passwordUi && (
           <div className="flex items-center border-b border-slate-200 mb-6 text-xs font-semibold">
             <button
               onClick={() => {
@@ -136,6 +200,7 @@ export const LoginPage: React.FC = () => {
               비밀번호 재설정
             </button>
           </div>
+          )}
 
           {/* Alert Messages */}
           {errorMsg && (
@@ -153,7 +218,7 @@ export const LoginPage: React.FC = () => {
           )}
 
           {/* Tab 1: Login Form */}
-          {activeTab === 'login' && (
+          {passwordUi && activeTab === 'login' && (
             <form onSubmit={handleLoginSubmit} className="space-y-4 text-xs">
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">이메일 계정</label>
@@ -208,7 +273,7 @@ export const LoginPage: React.FC = () => {
           )}
 
           {/* Tab 2: Reset Password Form */}
-          {activeTab === 'reset' && (
+          {passwordUi && activeTab === 'reset' && (
             <div className="space-y-4 text-xs">
               {resetStep === 1 ? (
                 <form onSubmit={handleResetRequest} className="space-y-4">
