@@ -15,6 +15,7 @@ import {
   Power,
 } from 'lucide-react';
 import { UserRole } from '../types';
+import { formatDateTime } from '../utils/dateAndRrule';
 
 export const AdminConsole: React.FC = () => {
   const {
@@ -407,7 +408,7 @@ export const AdminConsole: React.FC = () => {
                   {filteredLogs.map((log) => (
                     <tr key={log.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3 text-slate-500 tabular-nums">
-                        {new Date(log.createdAt).toLocaleString()}
+                        {formatDateTime(log.createdAt)}
                       </td>
                       <td className="p-3 font-semibold text-slate-900">{log.actorName}</td>
                       <td className="p-3">

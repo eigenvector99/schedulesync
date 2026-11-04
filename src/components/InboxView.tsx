@@ -15,7 +15,7 @@ import {
   Info,
 } from 'lucide-react';
 import { Assignment, SessionChangeRequest, Project } from '../types';
-import { KR_DAYS, checkEmployeeOverlap } from '../utils/dateAndRrule';
+import { KR_DAYS, checkEmployeeOverlap, formatDateTime } from '../utils/dateAndRrule';
 
 interface InboxViewProps {
   onSelectProject: (project: Project) => void;
@@ -266,7 +266,7 @@ export const InboxView: React.FC<InboxViewProps> = ({ onSelectProject }) => {
                       </div>
                       <p className="text-xs text-slate-500 mt-1">
                         배정자: <strong>{assigner?.name}</strong> · 배정일시:{' '}
-                        {new Date(asg.createdAt).toLocaleString()}
+                        {formatDateTime(asg.createdAt)}
                       </p>
                     </div>
 
@@ -555,7 +555,7 @@ export const InboxView: React.FC<InboxViewProps> = ({ onSelectProject }) => {
                       </div>
                       <p className="text-xs text-slate-500 mt-1">
                         변경 요청 허가권자: <strong>{requester?.name}</strong> · 요청일시:{' '}
-                        {new Date(cr.createdAt).toLocaleString()}
+                        {formatDateTime(cr.createdAt)}
                       </p>
                     </div>
 

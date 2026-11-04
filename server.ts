@@ -21,7 +21,7 @@ import {
   mapNotification,
   mapAuditLog,
 } from './server/mappers';
-import { checkEmployeeOverlap } from './src/utils/dateAndRrule';
+import { checkEmployeeOverlap, isValidTimeZone, MAX_EXPAND_DAYS, addDaysStr } from './src/utils/dateAndRrule';
 
 dotenv.config();
 
@@ -483,6 +483,8 @@ app.get('/api/state', authMiddleware, route(async (req, res) => {
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+/** Absolute instants must say which zone they are in; a bare local time would mean something else on every machine. */
+const ISO_WITH_OFFSET_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 const PROJECT_STATUSES = ['PLANNING', 'RECRUITING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'];
 
 function cleanStr(v: unknown, max: number): string | null {
@@ -511,6 +513,9 @@ function sanitizeProjectFields(input: any, partial: boolean): { fields?: Record<
       }
       f[k] = body[k];
     }
+  }
+  if (f.startDate && f.endDate && addDaysStr(f.startDate, MAX_EXPAND_DAYS) < f.endDate) {
+    return { error: '프로젝트 기간이 너무 깁니다. (최대 약 10년)' };
   }
   if (has('status')) {
     if (!PROJECT_STATUSES.includes(body.status)) return { error: '프로젝트 상태가 올바르지 않습니다.' };
@@ -552,10 +557,14 @@ function sanitizeSessions(input: unknown): { sessions?: SessionInput[]; error?: 
         return { error: '세션 시작/종료 시간이 올바르지 않습니다.' };
       }
     } else {
-      const a = Date.parse(s?.startAt);
-      const b = Date.parse(s?.endAt);
+      if (!ISO_WITH_OFFSET_RE.test(s?.startAt) || !ISO_WITH_OFFSET_RE.test(s?.endAt)) {
+        return { error: '단일 세션의 일시는 타임존(Z 또는 +09:00)을 포함한 형식이어야 합니다.' };
+      }
+      const a = Date.parse(s.startAt);
+      const b = Date.parse(s.endAt);
       if (Number.isNaN(a) || Number.isNaN(b) || a >= b) return { error: '세션 시작/종료 일시가 올바르지 않습니다.' };
     }
+    if (s?.timezone !== undefined && !isValidTimeZone(s.timezone)) return { error: '타임존이 올바르지 않습니다. (예: Asia/Seoul)' };
     out.push({
       title,
       startAt: typeof s.startAt === 'string' ? s.startAt : undefined,

@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import {
-  formatDate,
+  addDaysStr,
+  todayInTz,
   formatTime,
   getDaysRange,
   expandSessions,
@@ -35,7 +36,7 @@ export const TimelineCalendar: React.FC<TimelineCalendarProps> = ({ onSelectProj
   } = useApp();
 
   // Calendar Controls
-  const [baseDate, setBaseDate] = useState<string>('2026-11-01');
+  const [baseDate, setBaseDate] = useState<string>(() => todayInTz());
   const [rangeMode, setRangeMode] = useState<'7' | '14'>('14');
   const [selectedDeptId, setSelectedDeptId] = useState<string>('ALL');
   const [selectedProjectId, setSelectedProjectId] = useState<string>('ALL');
@@ -46,19 +47,15 @@ export const TimelineCalendar: React.FC<TimelineCalendarProps> = ({ onSelectProj
 
   // Navigate date range
   const handlePrev = () => {
-    const cur = new Date(`${baseDate}T00:00:00`);
-    cur.setDate(cur.getDate() - numDays);
-    setBaseDate(formatDate(cur));
+    setBaseDate(addDaysStr(baseDate, -numDays));
   };
 
   const handleNext = () => {
-    const cur = new Date(`${baseDate}T00:00:00`);
-    cur.setDate(cur.getDate() + numDays);
-    setBaseDate(formatDate(cur));
+    setBaseDate(addDaysStr(baseDate, numDays));
   };
 
   const handleToday = () => {
-    setBaseDate('2026-11-01');
+    setBaseDate(todayInTz());
   };
 
   // Filter employees
@@ -126,7 +123,7 @@ export const TimelineCalendar: React.FC<TimelineCalendarProps> = ({ onSelectProj
               onClick={handleToday}
               className="px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-200 transition-colors"
             >
-              오늘 (2026.11)
+              오늘 ({todayInTz().slice(0, 4)}.{todayInTz().slice(5, 7)})
             </button>
             <button
               onClick={handleNext}
