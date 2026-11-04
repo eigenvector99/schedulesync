@@ -104,6 +104,23 @@ export type SessionChangeRequestStatus =
   | 'CHANGE_REJECTED'
   | 'CHANGE_WITHDRAWN';
 
+export type ChangeCloseReason =
+  | 'BASE_CHANGED'
+  | 'NEW_CONFLICT'
+  | 'PROJECT_CLOSED'
+  | 'OWNER_CHANGED'
+  | 'REQUESTER_INACTIVE'
+  | 'WITHDRAWN_BY_REQUESTER';
+
+export const CHANGE_CLOSE_REASONS: Record<ChangeCloseReason, string> = {
+  BASE_CHANGED: '요청 이후 프로젝트 일정이 바뀌어 요청이 무효화되었습니다. 다시 요청해 주세요.',
+  NEW_CONFLICT: '요청 이후 승인받지 않은 새로운 시간 겹침이 생겨 요청이 무효화되었습니다. 다시 요청해 주세요.',
+  PROJECT_CLOSED: '프로젝트가 취소되었거나 종료되어 요청이 무효화되었습니다.',
+  OWNER_CHANGED: '프로젝트 등록자가 바뀌어 요청이 무효화되었습니다.',
+  REQUESTER_INACTIVE: '요청자가 더 이상 허가권자가 아니거나 비활성화되어 요청이 무효화되었습니다.',
+  WITHDRAWN_BY_REQUESTER: '요청자가 변경 요청을 철회했습니다.',
+};
+
 export interface SessionChangeRequest {
   id: string;
   projectId: string;
@@ -111,6 +128,9 @@ export interface SessionChangeRequest {
   proposedSessions: ProjectSession[];
   conflicts: ConflictDetail[];
   status: SessionChangeRequestStatus;
+  /** Set when the request was closed without a decision: see CHANGE_CLOSE_REASONS. */
+  closedReason?: ChangeCloseReason;
+  closedAt?: string;
   createdAt: string;
   decisions: ChangeDecision[];
 }

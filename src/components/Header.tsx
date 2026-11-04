@@ -16,6 +16,7 @@ import {
   AlertCircle,
   X,
 } from 'lucide-react';
+import { formatClock } from '../utils/dateAndRrule';
 
 interface HeaderProps {
   onOpenEmailDrawer: () => void;
@@ -260,10 +261,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenEmailDrawer }) => {
                             <div className="flex items-start justify-between gap-2">
                               <p className="font-semibold text-slate-800">{noti.title}</p>
                               <span className="text-[10px] text-slate-400 shrink-0">
-                                {new Date(noti.createdAt).toLocaleTimeString([], {
-                                  hour: '2-digit',
-                                  minute: '2-digit',
-                                })}
+                                {formatClock(noti.createdAt)}
                               </span>
                             </div>
                             <p className="text-slate-600 mt-1 leading-relaxed">{noti.message}</p>

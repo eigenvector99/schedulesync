@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { Mail, X, Inbox, ArrowRight, Clock, Send } from 'lucide-react';
+import { formatClock, formatDateTime } from '../utils/dateAndRrule';
 
 interface EmailDrawerProps {
   isOpen: boolean;
@@ -69,10 +70,7 @@ export const EmailDrawer: React.FC<EmailDrawerProps> = ({ isOpen, onClose }) => 
                         수신: {email.toName}
                       </span>
                       <span className="text-[10px] text-slate-400 shrink-0">
-                        {new Date(email.sentAt).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
+                        {formatClock(email.sentAt)}
                       </span>
                     </div>
                     <p className="font-medium text-slate-700 truncate mb-1">
@@ -104,7 +102,7 @@ export const EmailDrawer: React.FC<EmailDrawerProps> = ({ isOpen, onClose }) => 
                     </div>
                     <div className="text-[11px] text-slate-400 flex items-center gap-1">
                       <Clock className="w-3 h-3" />
-                      <span>{new Date(selectedEmail.sentAt).toLocaleString()}</span>
+                      <span>{formatDateTime(selectedEmail.sentAt)}</span>
                     </div>
                   </div>
                 </div>

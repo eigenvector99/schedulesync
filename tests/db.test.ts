@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { prepareDatabase, startServer, TestDb, TestServer } from './helpers';
-import { openDb, migrate, Db } from '../server/db';
+import { openDb, migrate, splitSql, Db } from '../server/db';
 
 const SESSION = (start: string, end: string, day = 1) => ({ title: 's', daysOfWeek: [day], startTime: start, endTime: end, timezone: 'Asia/Seoul' });
 
@@ -90,6 +90,27 @@ describe('concurrent requests', () => {
   });
 });
 
+test('the migration splitter handles trailing comments, $$ bodies and comment-only lines', () => {
+  const sql = [
+    '-- header comment;',
+    'ALTER TABLE t ADD COLUMN a text;   -- trailing comment',
+    'ALTER TABLE t ADD COLUMN b text;',
+    'CREATE FUNCTION f() RETURNS trigger AS $$',
+    'BEGIN',
+    '  RAISE EXCEPTION \'x\';',
+    'END;',
+    '$$ LANGUAGE plpgsql;',
+    'CREATE INDEX i ON t (a)',
+    '  WHERE a IS NOT NULL;',
+  ].join('\n');
+  const parts = splitSql(sql);
+  assert.equal(parts.length, 4);
+  assert.match(parts[0], /ADD COLUMN a/);
+  assert.match(parts[1], /ADD COLUMN b/);
+  assert.match(parts[2], /RAISE EXCEPTION/);
+  assert.match(parts[3], /WHERE a IS NOT NULL/);
+});
+
 describe('schema guarantees', () => {
   let tdb: TestDb;
   let db: Db;
@@ -111,7 +132,8 @@ describe('schema guarantees', () => {
   test('migrations are idempotent', async () => {
     await migrate(db);
     const n = (await db.query(`SELECT count(*)::int AS n FROM schema_migrations`)).rows[0].n;
-    assert.equal(n, 1);
+    const files = (await import('node:fs')).readdirSync(new URL('../server/migrations', import.meta.url)).filter((f) => f.endsWith('.sql')).length;
+    assert.equal(n, files);
   });
 
   test('the audit log is append-only', async () => {

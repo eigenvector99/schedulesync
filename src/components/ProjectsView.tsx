@@ -17,7 +17,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { Project, ProjectSession, ConflictDetail, Employee } from '../types';
-import { KR_DAYS, checkEmployeeOverlap } from '../utils/dateAndRrule';
+import { KR_DAYS, checkEmployeeOverlap, todayInTz, addDaysStr, zonedWallTimeToUtcMs } from '../utils/dateAndRrule';
 
 interface ProjectsViewProps {
   onSelectProject: (project: Project) => void;
@@ -70,8 +70,8 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({ onSelectProject }) =
   // Create Project Form State
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectDesc, setNewProjectDesc] = useState('');
-  const [newStartDate, setNewStartDate] = useState('2026-11-01');
-  const [newEndDate, setNewEndDate] = useState('2026-12-31');
+  const [newStartDate, setNewStartDate] = useState(() => todayInTz());
+  const [newEndDate, setNewEndDate] = useState(() => addDaysStr(todayInTz(), 60));
   const [newHeadcount, setNewHeadcount] = useState<number>(3);
   const [newColor, setNewColor] = useState('#2563eb');
   const [newSessionTitle, setNewSessionTitle] = useState('정기 작업 스프린트');
@@ -88,8 +88,9 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({ onSelectProject }) =
 
     const sessionPayload: Omit<ProjectSession, 'id' | 'projectId'> = {
       title: newSessionTitle,
-      startAt: `${newStartDate}T${newStartTime}:00Z`,
-      endAt: `${newEndDate}T${newEndTime}:00Z`,
+      // first start / last end as real instants (Seoul wall-clock time), not a fake "Z" timestamp
+      startAt: new Date(zonedWallTimeToUtcMs(newStartDate, newStartTime, 'Asia/Seoul')).toISOString(),
+      endAt: new Date(zonedWallTimeToUtcMs(newEndDate, newEndTime, 'Asia/Seoul')).toISOString(),
       rrule: `FREQ=WEEKLY;BYDAY=${newDaysOfWeek.map((d) => ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'][d]).join(',')}`,
       daysOfWeek: newDaysOfWeek,
       startTime: newStartTime,
@@ -925,8 +926,8 @@ const SessionChangeModal: React.FC<{
 
     const newSessionPayload: Omit<ProjectSession, 'id' | 'projectId'> = {
       title,
-      startAt: `${proj.startDate}T${startTime}:00Z`,
-      endAt: `${proj.endDate}T${endTime}:00Z`,
+      startAt: new Date(zonedWallTimeToUtcMs(proj.startDate, startTime, 'Asia/Seoul')).toISOString(),
+      endAt: new Date(zonedWallTimeToUtcMs(proj.endDate, endTime, 'Asia/Seoul')).toISOString(),
       rrule: `FREQ=WEEKLY;BYDAY=${daysOfWeek.map((d) => ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'][d]).join(',')}`,
       daysOfWeek,
       startTime,
