@@ -5,16 +5,14 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { prepareDatabase, TestDb } from './helpers';
 
 const PORT = 3200 + Math.floor(Math.random() * 500);
 const BASE = `http://127.0.0.1:${PORT}`;
 const ADMIN = { email: 'admin@test.local', password: 'Admin12345' };
 let server: ChildProcess;
 let logBuf = '';
-let dataDir: string;
+let testDb: TestDb;
 
 async function call(method: string, url: string, token?: string | null, body?: unknown) {
   const r = await fetch(BASE + url, {
@@ -39,13 +37,13 @@ function mailToken(email: string): string {
 }
 
 before(async () => {
-  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schedulesync-test-'));
+  testDb = await prepareDatabase('api');
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     env: {
       ...process.env,
       NODE_ENV: 'test',
       PORT: String(PORT),
-      DATA_DIR: dataDir,
+      ...testDb.env,
       ADMIN_EMAIL: ADMIN.email,
       ADMIN_PASSWORD: ADMIN.password,
       APP_URL: 'http://app.test',
@@ -54,7 +52,7 @@ before(async () => {
   });
   server.stdout!.on('data', (d) => (logBuf += d));
   server.stderr!.on('data', (d) => (logBuf += d));
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 150; i++) {
     try {
       await fetch(BASE + '/api/auth/me');
       return;
@@ -65,9 +63,10 @@ before(async () => {
   throw new Error('server did not start:\n' + logBuf);
 });
 
-after(() => {
+after(async () => {
   server?.kill('SIGTERM');
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, 300));
+  await testDb?.cleanup();
 });
 
 // shared fixtures, filled by the first test

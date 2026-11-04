@@ -6,9 +6,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, ChildProcess } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { prepareDatabase, TestDb } from './helpers';
 
 const PORT = 3700 + Math.floor(Math.random() * 200);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -25,7 +23,7 @@ let lookups: string[] = [];
 let slackServer: http.Server;
 let slackPort = 0;
 let server: ChildProcess;
-let dataDir: string;
+let testDb: TestDb;
 
 async function call(method: string, url: string, token?: string | null, body?: unknown) {
   const r = await fetch(BASE + url, {
@@ -82,14 +80,14 @@ before(async () => {
   await new Promise<void>((r) => slackServer.listen(0, '127.0.0.1', r));
   slackPort = (slackServer.address() as any).port;
 
-  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schedulesync-slack-'));
+  testDb = await prepareDatabase('slack');
   let log = '';
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     env: {
       ...process.env,
       NODE_ENV: 'test',
       PORT: String(PORT),
-      DATA_DIR: dataDir,
+      ...testDb.env,
       ADMIN_EMAIL: ADMIN.email,
       ADMIN_PASSWORD: ADMIN.password,
       APP_URL: 'http://app.test',
@@ -100,7 +98,7 @@ before(async () => {
   });
   server.stdout!.on('data', (d) => (log += d));
   server.stderr!.on('data', (d) => (log += d));
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 150; i++) {
     try {
       await fetch(BASE + '/api/auth/me');
       return;
@@ -111,10 +109,11 @@ before(async () => {
   throw new Error('server did not start:\n' + log);
 });
 
-after(() => {
+after(async () => {
   server?.kill('SIGTERM');
   slackServer?.close();
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, 300));
+  await testDb?.cleanup();
 });
 
 let admin = '';
@@ -156,7 +155,7 @@ test('someone who is not in Slack: delivery fails and the admin receives a one-t
   assert.equal((await call('POST', '/api/auth/password-reset-confirm', null, { token, newPassword: 'Passw0rd-Gxx' })).s, 200);
 
   const logs = (await call('GET', '/api/state', admin)).j.auditLogs;
-  assert.ok(logs.some((l: any) => l.action === 'CREATE_EMPLOYEE' && l.details.includes('발송 실패')));
+  assert.ok(logs.some((l: any) => l.action === 'INVITE_DELIVERY_FAILED' && l.details.includes('발송 실패')));
 });
 
 test('resending an invitation issues a fresh link and invalidates the previous one', async () => {
