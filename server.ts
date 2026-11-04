@@ -7,6 +7,20 @@ import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 import { deliver, notifyDM, verifySlack, DeliveryResult } from './server/notifier';
+import { openDb, migrate, Db, Queryable } from './server/db';
+import {
+  UserRecord,
+  mapUser,
+  publicUser,
+  mapDepartment,
+  mapProject,
+  mapSession,
+  mapAssignment,
+  mapChangeRequest,
+  mapAllowedOverlap,
+  mapNotification,
+  mapAuditLog,
+} from './server/mappers';
 import { checkEmployeeOverlap } from './src/utils/dateAndRrule';
 
 dotenv.config();
@@ -30,52 +44,12 @@ app.use((_req, res, next) => {
 app.use(express.json({ limit: '1mb' }));
 
 // -------------------------------------------------------------
-// Database file location (DATA_DIR, default ./data)
+// Database (PostgreSQL via DATABASE_URL, or embedded PostgreSQL under DATA_DIR)
 // -------------------------------------------------------------
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.resolve(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'database.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-interface UserRecord {
-  id: string;
-  email: string;
-  name: string;
-  departmentId: string;
-  role: 'EMPLOYEE' | 'APPROVER' | 'ADMIN';
-  status: 'ACTIVE' | 'INVITED' | 'DISABLED';
-  timezone: string;
-  avatarColor: string;
-  passwordSalt: string;
-  passwordHash: string;
-  /** PBKDF2 iteration count. Missing on legacy records (= LEGACY_PBKDF2_ITER). */
-  passwordIter?: number;
-  /** SHA-256 of the one-time reset / invitation token (the raw token is only ever e-mailed). */
-  resetTokenHash?: string;
-  resetTokenExpiresAt?: string;
-}
-
-interface TokenRecord {
-  /** SHA-256 of the bearer token. The raw token is never stored. */
-  tokenHash: string;
-  userId: string;
-  expiresAt: string;
-}
-
-interface DBData {
-  users: UserRecord[];
-  departments: any[];
-  projects: any[];
-  sessions: any[];
-  assignments: any[];
-  changeRequests: any[];
-  allowedOverlaps: any[];
-  notifications: any[];
-  mockEmails: any[];
-  auditLogs: any[];
-  tokens: TokenRecord[];
-}
+let db: Db;
 
 // -------------------------------------------------------------
 // Crypto / ID helpers
@@ -115,57 +89,94 @@ function validatePassword(pw: unknown): string | null {
 }
 
 // -------------------------------------------------------------
-// Database Persistence Layer (File-backed; see README for the planned RDB migration)
+// HTTP / transaction plumbing
 // -------------------------------------------------------------
-function emptyDB(): DBData {
-  return {
-    users: [],
-    departments: [],
-    projects: [],
-    sessions: [],
-    assignments: [],
-    changeRequests: [],
-    allowedOverlaps: [],
-    notifications: [],
-    mockEmails: [],
-    auditLogs: [],
-    tokens: [],
-  };
-}
-
-function loadDB(): DBData {
-  if (!fs.existsSync(DB_FILE)) return emptyDB();
-  const raw = fs.readFileSync(DB_FILE, 'utf-8');
-  try {
-    const parsed = { ...emptyDB(), ...JSON.parse(raw) } as DBData;
-    // Drop sessions issued by the legacy schema (raw tokens) and expired ones.
-    const now = Date.now();
-    parsed.tokens = (parsed.tokens || []).filter((t: any) => t.tokenHash && new Date(t.expiresAt).getTime() > now);
-    return parsed;
-  } catch (e) {
-    // Never silently reset production data: keep the broken file for recovery and stop.
-    const backup = `${DB_FILE}.corrupt-${Date.now()}`;
-    fs.copyFileSync(DB_FILE, backup);
-    console.error(`[FATAL] ${DB_FILE} could not be parsed. A copy was saved to ${backup}.`, e);
-    process.exit(1);
+class HttpError extends Error {
+  constructor(public status: number, public body: Record<string, unknown>) {
+    super(String(body.error ?? status));
   }
 }
+const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => new HttpError(status, { error, ...extra });
 
-function saveDB(data: DBData) {
-  // Write to a temp file and rename so a crash can never leave a half-written database.
-  const tmp = `${DB_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  fs.renameSync(tmp, DB_FILE);
+interface AuthenticatedRequest extends Request {
+  user?: UserRecord;
+  tokenHash?: string;
 }
 
-let db: DBData = loadDB();
+/** Express 4 does not catch rejected promises; this turns them (and HttpError) into responses. */
+const route =
+  (fn: (req: AuthenticatedRequest, res: Response) => Promise<unknown>) =>
+  (req: Request, res: Response) => {
+    fn(req as AuthenticatedRequest, res).catch((e) => {
+      if (e instanceof HttpError) return res.status(e.status).json(e.body);
+      console.error(`[error] ${req.method} ${req.path}:`, e);
+      if (!res.headersSent) res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+    });
+  };
 
+interface Ctx {
+  q: Queryable;
+  /** Runs after the transaction committed (Slack DMs must never announce rolled-back changes). */
+  after: (fn: () => unknown) => void;
+}
+
+async function transact<T>(fn: (c: Ctx) => Promise<T>): Promise<T> {
+  const hooks: Array<() => unknown> = [];
+  const result = await db.tx((q) => fn({ q, after: (f) => hooks.push(f) }));
+  for (const h of hooks) {
+    try {
+      await h();
+    } catch (e) {
+      console.error('[after-commit] hook failed:', e);
+    }
+  }
+  return result;
+}
+
+const isUniqueViolation = (e: any) => e?.code === '23505' || /unique constraint|duplicate key/i.test(String(e?.message));
+
+// -------------------------------------------------------------
+// Notifications & audit
+// -------------------------------------------------------------
+function appUrl(): string {
+  return (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+}
+
+async function logAudit(
+  q: Queryable,
+  actor: Pick<UserRecord, 'id' | 'name'> | undefined,
+  action: string,
+  targetType: string,
+  targetId: string,
+  details: string
+) {
+  await q.query(
+    `INSERT INTO audit_logs (id, actor_id, actor_name, action, target_type, target_id, details) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [newId('log'), actor?.id || 'SYSTEM', actor?.name || '시스템', action, targetType, targetId, details]
+  );
+}
+
+/** In-app notification now; Slack DM after the transaction commits. */
+async function notify(c: Ctx, recipientId: string, type: string, title: string, message: string, linkTab: string) {
+  await c.q.query(
+    `INSERT INTO notifications (id, recipient_id, type, title, message, link_tab) VALUES ($1,$2,$3,$4,$5,$6)`,
+    [newId('noti'), recipientId, type, title, message, linkTab]
+  );
+  const r = await c.q.query(`SELECT email, status FROM users WHERE id = $1`, [recipientId]);
+  if (r.rows[0]?.status === 'ACTIVE') c.after(() => notifyDM(r.rows[0].email, title, message));
+}
+
+// -------------------------------------------------------------
+// First-run bootstrap
+// -------------------------------------------------------------
 /**
- * First-run bootstrap: the only account that ever exists out of the box is the administrator
- * described by ADMIN_EMAIL / ADMIN_PASSWORD. There are no built-in demo users or passwords.
+ * The only account that ever exists out of the box is the administrator described by
+ * ADMIN_EMAIL / ADMIN_PASSWORD. There are no built-in demo users or passwords.
  */
 async function bootstrapAdmin() {
-  if (db.users.length > 0) return;
+  const { rows } = await db.query(`SELECT count(*)::int AS n FROM users`);
+  if (rows[0].n > 0) return;
+
   const email = process.env.ADMIN_EMAIL?.trim();
   const password = process.env.ADMIN_PASSWORD;
   const pwError = validatePassword(password);
@@ -178,27 +189,16 @@ async function bootstrapAdmin() {
   }
 
   const salt = generateSalt();
-  const deptId = 'dept-1';
-  db.departments.push({ id: deptId, name: '기본 부서', headEmployeeId: '' });
-  db.users.push({
-    id: newId('emp'),
-    email: email!,
-    name: process.env.ADMIN_NAME?.trim() || '시스템 관리자',
-    departmentId: deptId,
-    role: 'ADMIN',
-    status: 'ACTIVE',
-    timezone: 'Asia/Seoul',
-    avatarColor: 'bg-slate-700',
-    passwordSalt: salt,
-    passwordHash: await hashPassword(password!, salt),
-    passwordIter: PBKDF2_ITER,
+  const hash = await hashPassword(password!, salt);
+  await db.tx(async (q) => {
+    await q.query(`INSERT INTO departments (id, name) VALUES ('dept-1', '기본 부서')`);
+    await q.query(
+      `INSERT INTO users (id, email, name, department_id, role, status, timezone, avatar_color, password_salt, password_hash, password_iter)
+       VALUES ($1,$2,$3,'dept-1','ADMIN','ACTIVE','Asia/Seoul','bg-slate-700',$4,$5,$6)`,
+      [newId('emp'), email, process.env.ADMIN_NAME?.trim() || '시스템 관리자', salt, hash, PBKDF2_ITER]
+    );
   });
-  saveDB(db);
   console.log(`[bootstrap] 최초 관리자 계정을 생성했습니다: ${email}`);
-}
-
-function appUrl(): string {
-  return (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 }
 
 /**
@@ -207,14 +207,16 @@ function appUrl(): string {
  * manually when delivery failed; callers must never expose it to anonymous requests.
  */
 async function issueResetToken(
-  user: UserRecord,
+  user: Pick<UserRecord, 'id' | 'name' | 'email'>,
   ttlMinutes: number,
   kind: 'reset' | 'invite'
 ): Promise<{ link: string; delivery: DeliveryResult }> {
   const token = crypto.randomBytes(32).toString('hex');
-  user.resetTokenHash = sha256(token);
-  user.resetTokenExpiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
-  saveDB(db);
+  await db.query(`UPDATE users SET reset_token_hash = $2, reset_token_expires_at = now() + make_interval(mins => $3::int) WHERE id = $1`, [
+    user.id,
+    sha256(token),
+    ttlMinutes,
+  ]);
 
   const link = `${appUrl()}/?resetToken=${token}`;
   const subject = kind === 'invite' ? '[ScheduleSync] 계정이 발급되었습니다' : '[ScheduleSync] 비밀번호 재설정 안내';
@@ -242,88 +244,55 @@ function rateLimited(key: string, max: number, windowMs: number): boolean {
   return bucket.count > max;
 }
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, b] of rateBuckets) if (b.resetAt <= now) rateBuckets.delete(k);
-  const before = db.tokens.length;
-  db.tokens = db.tokens.filter((t) => new Date(t.expiresAt).getTime() > now);
-  if (db.tokens.length !== before) saveDB(db);
-}, 10 * 60_000).unref();
-
 // -------------------------------------------------------------
 // Authentication Middleware
 // -------------------------------------------------------------
-interface AuthenticatedRequest extends Request {
-  user?: UserRecord;
-  tokenHash?: string;
-}
-
-const authMiddleware = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const r = req as AuthenticatedRequest;
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: '인증이 필요합니다. (Missing token)' });
   }
-
   const tokenHash = sha256(authHeader.substring(7));
-  const tokenRecord = db.tokens.find((t) => t.tokenHash === tokenHash);
-  if (!tokenRecord || new Date(tokenRecord.expiresAt).getTime() <= Date.now()) {
-    return res.status(401).json({ error: '유효하지 않거나 만료된 세션입니다.' });
-  }
-
-  const user = db.users.find((u) => u.id === tokenRecord.userId);
-  if (!user || user.status !== 'ACTIVE') {
-    return res.status(403).json({ error: '계정이 비활성화되었거나 존재하지 않습니다.' });
-  }
-
-  req.user = user;
-  req.tokenHash = tokenHash;
-  next();
+  db.query(
+    `SELECT u.* FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = $1 AND t.expires_at > now()`,
+    [tokenHash]
+  )
+    .then(({ rows }) => {
+      if (rows.length === 0) return res.status(401).json({ error: '유효하지 않거나 만료된 세션입니다.' });
+      const user = mapUser(rows[0]);
+      if (user.status !== 'ACTIVE') return res.status(403).json({ error: '계정이 비활성화되었거나 존재하지 않습니다.' });
+      r.user = user;
+      r.tokenHash = tokenHash;
+      next();
+    })
+    .catch((e) => {
+      console.error('[auth] lookup failed:', e);
+      res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+    });
 };
 
-function revokeSessions(userId: string, exceptTokenHash?: string) {
-  db.tokens = db.tokens.filter((t) => t.userId !== userId || t.tokenHash === exceptTokenHash);
-}
-
-function publicUser(u: UserRecord, viewer: UserRecord) {
-  const { passwordHash, passwordSalt, passwordIter, resetTokenHash, resetTokenExpiresAt, ...safe } = u;
-  // E-mail addresses are only visible to the owner and administrators.
-  if (viewer.role !== 'ADMIN' && viewer.id !== u.id) return { ...safe, email: '' };
-  return safe;
-}
-
-function logAudit(
-  actor: UserRecord | undefined,
-  action: string,
-  targetType: string,
-  targetId: string,
-  details: string
-) {
-  const log = {
-    id: newId('log'),
-    actorId: actor?.id || 'SYSTEM',
-    actorName: actor?.name || '시스템',
-    action,
-    targetType,
-    targetId,
-    details,
-    createdAt: new Date().toISOString(),
-  };
-  db.auditLogs.unshift(log);
-  saveDB(db);
-}
+const revokeSessions = (q: Queryable, userId: string, exceptTokenHash?: string) =>
+  q.query(`DELETE FROM auth_tokens WHERE user_id = $1 AND token_hash IS DISTINCT FROM $2`, [userId, exceptTokenHash ?? null]);
 
 // -------------------------------------------------------------
 // REST API Endpoints
 // -------------------------------------------------------------
 
+// 0. Health check (load balancers / PaaS probes)
+app.get('/api/health', route(async (_req, res) => {
+  await db.query('SELECT 1');
+  res.json({ ok: true, db: db.kind });
+}));
+
 // 1. Auth: Login
 const LOGIN_ERROR = '이메일 또는 비밀번호가 올바르지 않습니다.';
 const DUMMY_SALT = generateSalt();
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', route(async (req, res) => {
   const { email, password } = req.body ?? {};
   if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
-    return res.status(400).json({ error: '이메일과 비밀번호를 모두 입력하세요.' });
+    throw fail(400, '이메일과 비밀번호를 모두 입력하세요.');
   }
 
   // Brute-force protection: per IP and per target account.
@@ -331,179 +300,182 @@ app.post('/api/auth/login', async (req, res) => {
     rateLimited(`login:ip:${req.ip}`, 30, 15 * 60_000) ||
     rateLimited(`login:acct:${email.toLowerCase()}`, 10, 15 * 60_000)
   ) {
-    return res.status(429).json({ error: '로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요.' });
+    throw fail(429, '로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요.');
   }
 
-  const user = db.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+  const found = await db.query(`SELECT * FROM users WHERE lower(email) = lower($1)`, [email]);
+  const user = found.rows[0] ? mapUser(found.rows[0]) : undefined;
   // Always run a hash so response time does not reveal whether the account exists.
   const iter = user?.passwordIter ?? LEGACY_PBKDF2_ITER;
   const computedHash = await hashPassword(password, user?.passwordSalt ?? DUMMY_SALT, iter);
 
-  if (!user || !safeEqualHex(computedHash, user.passwordHash)) {
-    return res.status(401).json({ error: LOGIN_ERROR });
-  }
-  if (user.status === 'DISABLED') {
-    return res.status(403).json({ error: '비활성화된 계정입니다. 관리자에게 문의하세요.' });
-  }
+  if (!user || !safeEqualHex(computedHash, user.passwordHash)) throw fail(401, LOGIN_ERROR);
+  if (user.status === 'DISABLED') throw fail(403, '비활성화된 계정입니다. 관리자에게 문의하세요.');
   if (user.status !== 'ACTIVE') {
-    return res.status(403).json({ error: '아직 활성화되지 않은 계정입니다. 초대 메일의 링크로 비밀번호를 설정하세요.' });
+    throw fail(403, '아직 활성화되지 않은 계정입니다. 초대 메시지의 링크로 비밀번호를 설정하세요.');
   }
 
   // Transparently upgrade legacy hashes to the current work factor.
+  let upgrade: { salt: string; hash: string } | null = null;
   if (iter !== PBKDF2_ITER) {
-    user.passwordSalt = generateSalt();
-    user.passwordHash = await hashPassword(password, user.passwordSalt);
-    user.passwordIter = PBKDF2_ITER;
+    const salt = generateSalt();
+    upgrade = { salt, hash: await hashPassword(password, salt) };
   }
 
   const token = `tok_${crypto.randomBytes(32).toString('hex')}`;
-  db.tokens.push({
-    tokenHash: sha256(token),
-    userId: user.id,
-    expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+  await transact(async ({ q }) => {
+    if (upgrade) {
+      await q.query(`UPDATE users SET password_salt = $2, password_hash = $3, password_iter = $4 WHERE id = $1`, [
+        user.id,
+        upgrade.salt,
+        upgrade.hash,
+        PBKDF2_ITER,
+      ]);
+    }
+    await q.query(`INSERT INTO auth_tokens (token_hash, user_id, expires_at) VALUES ($1,$2, now() + interval '7 days')`, [sha256(token), user.id]);
+    await logAudit(q, user, 'USER_LOGIN', 'EMPLOYEE', user.id, `로그인 성공 (${user.email})`);
   });
-  saveDB(db);
-
-  logAudit(user, 'USER_LOGIN', 'EMPLOYEE', user.id, `로그인 성공 (${user.email})`);
 
   res.json({ token, user: publicUser(user, user) });
-});
+}));
 
 // 2. Auth: Get Current User (Me)
-app.get('/api/auth/me', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.get('/api/auth/me', authMiddleware, route(async (req, res) => {
   res.json({ user: publicUser(req.user!, req.user!) });
-});
+}));
 
 // 3. Auth: Logout
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', route(async (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const tokenHash = sha256(authHeader.substring(7));
-    db.tokens = db.tokens.filter((t) => t.tokenHash !== tokenHash);
-    saveDB(db);
+    await db.query(`DELETE FROM auth_tokens WHERE token_hash = $1`, [sha256(authHeader.substring(7))]);
   }
   res.json({ success: true });
-});
+}));
 
 // 4. Auth: Change Password
-app.post('/api/auth/change-password', authMiddleware, async (req: AuthenticatedRequest, res) => {
+app.post('/api/auth/change-password', authMiddleware, route(async (req, res) => {
   const { currentPassword, newPassword } = req.body ?? {};
   const user = req.user!;
 
-  if (rateLimited(`chpw:${user.id}`, 10, 15 * 60_000)) {
-    return res.status(429).json({ error: '시도가 너무 많습니다. 잠시 후 다시 시도하세요.' });
-  }
+  if (rateLimited(`chpw:${user.id}`, 10, 15 * 60_000)) throw fail(429, '시도가 너무 많습니다. 잠시 후 다시 시도하세요.');
   const pwError = validatePassword(newPassword);
-  if (pwError) return res.status(400).json({ error: pwError });
-  if (typeof currentPassword !== 'string') {
-    return res.status(400).json({ error: '현재 비밀번호를 입력하세요.' });
-  }
+  if (pwError) throw fail(400, pwError);
+  if (typeof currentPassword !== 'string') throw fail(400, '현재 비밀번호를 입력하세요.');
 
   const currentComputed = await hashPassword(currentPassword, user.passwordSalt, user.passwordIter ?? LEGACY_PBKDF2_ITER);
-  if (!safeEqualHex(currentComputed, user.passwordHash)) {
-    return res.status(400).json({ error: '현재 비밀번호가 일치하지 않습니다.' });
-  }
+  if (!safeEqualHex(currentComputed, user.passwordHash)) throw fail(400, '현재 비밀번호가 일치하지 않습니다.');
 
-  user.passwordSalt = generateSalt();
-  user.passwordHash = await hashPassword(newPassword, user.passwordSalt);
-  user.passwordIter = PBKDF2_ITER;
-  // Sign out every other device.
-  revokeSessions(user.id, req.tokenHash);
-  saveDB(db);
-
-  logAudit(user, 'CHANGE_PASSWORD', 'EMPLOYEE', user.id, '비밀번호 변경 완료');
+  const salt = generateSalt();
+  const hash = await hashPassword(newPassword, salt);
+  await transact(async ({ q }) => {
+    await q.query(`UPDATE users SET password_salt = $2, password_hash = $3, password_iter = $4 WHERE id = $1`, [user.id, salt, hash, PBKDF2_ITER]);
+    await revokeSessions(q, user.id, req.tokenHash); // sign out every other device
+    await logAudit(q, user, 'CHANGE_PASSWORD', 'EMPLOYEE', user.id, '비밀번호 변경 완료');
+  });
   res.json({ success: true });
-});
+}));
 
-// 5. Auth: Reset Password Request. The token is only ever delivered by e-mail, and the response
-// is identical whether or not the address is registered (no account enumeration).
-app.post('/api/auth/password-reset-request', async (req, res) => {
+// 5. Auth: Reset Password Request. The token is only ever delivered out of band (Slack DM / mail), and the
+// response is identical whether or not the address is registered (no account enumeration).
+app.post('/api/auth/password-reset-request', route(async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-  const generic = { success: true, message: '입력하신 이메일이 등록되어 있다면 재설정 안내 메일이 발송됩니다.' };
-  if (!email) return res.status(400).json({ error: '이메일을 입력하세요.' });
+  const generic = { success: true, message: '입력하신 이메일이 등록되어 있다면 재설정 안내가 발송됩니다.' };
+  if (!email) throw fail(400, '이메일을 입력하세요.');
 
   if (rateLimited(`reset:ip:${req.ip}`, 10, 60 * 60_000) || rateLimited(`reset:acct:${email}`, 3, 60 * 60_000)) {
     return res.json(generic); // silently throttle; do not reveal anything
   }
 
-  const user = db.users.find((u) => u.email.toLowerCase() === email);
+  const found = await db.query(`SELECT * FROM users WHERE lower(email) = $1`, [email]);
+  const user = found.rows[0] ? mapUser(found.rows[0]) : undefined;
   if (user && user.status !== 'DISABLED') {
     await issueResetToken(user, 30, 'reset');
-    logAudit(user, 'PASSWORD_RESET_REQUEST', 'EMPLOYEE', user.id, '비밀번호 재설정 메일 발송');
+    await logAudit(db, user, 'PASSWORD_RESET_REQUEST', 'EMPLOYEE', user.id, '비밀번호 재설정 링크 발송');
   }
   res.json(generic);
-});
+}));
 
 // 6. Auth: Confirm Password Reset / Account Activation with a one-time token
-app.post('/api/auth/password-reset-confirm', async (req, res) => {
+app.post('/api/auth/password-reset-confirm', route(async (req, res) => {
   const { token, newPassword } = req.body ?? {};
-  if (typeof token !== 'string' || !token) {
-    return res.status(400).json({ error: '유효하지 않거나 만료된 재설정 토큰입니다.' });
-  }
-  if (rateLimited(`resetc:ip:${req.ip}`, 20, 60 * 60_000)) {
-    return res.status(429).json({ error: '시도가 너무 많습니다. 잠시 후 다시 시도하세요.' });
-  }
+  if (typeof token !== 'string' || !token) throw fail(400, '유효하지 않거나 만료된 재설정 토큰입니다.');
+  if (rateLimited(`resetc:ip:${req.ip}`, 20, 60 * 60_000)) throw fail(429, '시도가 너무 많습니다. 잠시 후 다시 시도하세요.');
   const pwError = validatePassword(newPassword);
-  if (pwError) return res.status(400).json({ error: pwError });
+  if (pwError) throw fail(400, pwError);
 
   const tokenHash = sha256(token.trim());
-  const user = db.users.find(
-    (u) =>
-      u.resetTokenHash &&
-      safeEqualHex(u.resetTokenHash, tokenHash) &&
-      u.resetTokenExpiresAt &&
-      new Date(u.resetTokenExpiresAt).getTime() > Date.now()
-  );
-  if (!user || user.status === 'DISABLED') {
-    return res.status(400).json({ error: '유효하지 않거나 만료된 재설정 토큰입니다.' });
-  }
+  const salt = generateSalt();
+  const hash = await hashPassword(newPassword, salt);
 
-  user.passwordSalt = generateSalt();
-  user.passwordHash = await hashPassword(newPassword, user.passwordSalt);
-  user.passwordIter = PBKDF2_ITER;
-  user.resetTokenHash = undefined;
-  user.resetTokenExpiresAt = undefined;
-  if (user.status === 'INVITED') user.status = 'ACTIVE';
-  revokeSessions(user.id);
-  saveDB(db);
-
-  logAudit(user, 'RESET_PASSWORD', 'EMPLOYEE', user.id, '토큰을 통한 비밀번호 설정/재설정 완료');
+  await transact(async ({ q }) => {
+    // The token is cleared in the same statement that consumes it, so concurrent use can succeed only once.
+    const r = await q.query(
+      `UPDATE users
+          SET password_salt = $2, password_hash = $3, password_iter = $4,
+              reset_token_hash = NULL, reset_token_expires_at = NULL,
+              status = CASE WHEN status = 'INVITED' THEN 'ACTIVE' ELSE status END
+        WHERE reset_token_hash = $1 AND reset_token_expires_at > now() AND status <> 'DISABLED'
+        RETURNING id, name`,
+      [tokenHash, salt, hash, PBKDF2_ITER]
+    );
+    if (r.rows.length === 0) throw fail(400, '유효하지 않거나 만료된 재설정 토큰입니다.');
+    const u = r.rows[0];
+    await revokeSessions(q, u.id);
+    await logAudit(q, u, 'RESET_PASSWORD', 'EMPLOYEE', u.id, '토큰을 통한 비밀번호 설정/재설정 완료');
+  });
   res.json({ success: true });
-});
+}));
 
 // 7. Get System State, scoped to what the caller is allowed to see.
 //    Calendar-relevant data (projects, sessions, assignments) is company-wide by design;
 //    personal and administrative data is not.
-app.get('/api/state', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.get('/api/state', authMiddleware, route(async (req, res) => {
   const me = req.user!;
   const isAdmin = me.role === 'ADMIN';
 
-  const involvedInAssignment = (a: any) =>
-    isAdmin || a.employeeId === me.id || a.assignedBy === me.id || a.approvalDecisions?.some((d: any) => d.approverId === me.id);
+  const [departments, users, projects, sessions, assignments, decisions, crs, cds, overlaps, notifications, audit] = await Promise.all([
+    db.query(`SELECT * FROM departments ORDER BY name`),
+    db.query(`SELECT * FROM users ${isAdmin ? '' : `WHERE status <> 'INVITED'`} ORDER BY created_at, id`),
+    db.query(`SELECT * FROM projects ORDER BY created_at DESC, id`),
+    db.query(`SELECT * FROM sessions ORDER BY project_id, position`),
+    db.query(`SELECT * FROM assignments ORDER BY created_at DESC, id`),
+    db.query(`SELECT * FROM approval_decisions ORDER BY id`),
+    db.query(`SELECT * FROM change_requests ORDER BY created_at DESC, id`),
+    db.query(`SELECT * FROM change_decisions ORDER BY id`),
+    db.query(`SELECT * FROM allowed_overlaps ORDER BY created_at`),
+    db.query(`SELECT * FROM notifications WHERE recipient_id = $1 ORDER BY created_at DESC, id`, [me.id]),
+    isAdmin ? db.query(`SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 2000`) : Promise.resolve({ rows: [] as any[] }),
+  ]);
+
+  const decisionsByAsg = new Map<string, any[]>();
+  for (const d of decisions.rows) (decisionsByAsg.get(d.assignment_id) ?? decisionsByAsg.set(d.assignment_id, []).get(d.assignment_id)!).push(d);
+  const decisionsByCr = new Map<string, any[]>();
+  for (const d of cds.rows) (decisionsByCr.get(d.change_request_id) ?? decisionsByCr.set(d.change_request_id, []).get(d.change_request_id)!).push(d);
 
   res.json({
-    departments: db.departments,
-    employees: db.users.filter((u) => u.status !== 'INVITED' || isAdmin).map((u) => publicUser(u, me)),
-    projects: db.projects,
-    sessions: db.sessions,
+    departments: departments.rows.map(mapDepartment),
+    employees: users.rows.map((r) => publicUser(mapUser(r), me)),
+    projects: projects.rows.map(mapProject),
+    sessions: sessions.rows.map(mapSession),
     // Decline / reject reasons are only shown to the people involved.
-    assignments: db.assignments.map((a) => {
-      if (involvedInAssignment(a)) return a;
+    assignments: assignments.rows.map((r) => {
+      const decs = decisionsByAsg.get(r.id) ?? [];
+      const involved = isAdmin || r.employee_id === me.id || r.assigned_by === me.id || decs.some((d) => d.approver_id === me.id);
+      const a = mapAssignment(r, decs);
+      if (involved) return a;
       const { declineReason, ...rest } = a;
-      return {
-        ...rest,
-        approvalDecisions: (a.approvalDecisions || []).map(({ comment, ...d }: any) => d),
-      };
+      return { ...rest, approvalDecisions: a.approvalDecisions.map(({ comment, ...d }) => d) };
     }),
-    changeRequests: db.changeRequests.filter(
-      (c) => isAdmin || c.requestedBy === me.id || c.decisions?.some((d: any) => d.actorId === me.id)
-    ),
-    allowedOverlaps: db.allowedOverlaps,
-    notifications: db.notifications.filter((n) => n.recipientId === me.id),
-    mockEmails: db.mockEmails.filter((m) => m.to?.toLowerCase() === me.email.toLowerCase()),
-    auditLogs: isAdmin ? db.auditLogs : [],
+    changeRequests: crs.rows
+      .map((r) => mapChangeRequest(r, decisionsByCr.get(r.id) ?? []))
+      .filter((c) => isAdmin || c.requestedBy === me.id || c.decisions.some((d) => d.actorId === me.id)),
+    allowedOverlaps: overlaps.rows.map(mapAllowedOverlap),
+    notifications: notifications.rows.map(mapNotification),
+    mockEmails: [],
+    auditLogs: audit.rows.map(mapAuditLog),
   });
-});
+}));
 
 // -------------------------------------------------------------
 // Validation helpers
@@ -557,9 +529,20 @@ function sanitizeProjectFields(input: any, partial: boolean): { fields?: Record<
   return { fields: f };
 }
 
-function sanitizeSessions(input: unknown): { sessions?: any[]; error?: string } {
+interface SessionInput {
+  title: string;
+  startAt?: string;
+  endAt?: string;
+  rrule?: string;
+  daysOfWeek?: number[];
+  startTime?: string;
+  endTime?: string;
+  timezone: string;
+}
+
+function sanitizeSessions(input: unknown): { sessions?: SessionInput[]; error?: string } {
   if (!Array.isArray(input) || input.length > 50) return { error: '세션 목록이 올바르지 않습니다.' };
-  const out: any[] = [];
+  const out: SessionInput[] = [];
   for (const s of input as any[]) {
     const title = typeof s?.title === 'string' ? s.title.slice(0, 120) : '';
     const recurring = Array.isArray(s?.daysOfWeek) && s.daysOfWeek.length > 0;
@@ -575,12 +558,12 @@ function sanitizeSessions(input: unknown): { sessions?: any[]; error?: string } 
     }
     out.push({
       title,
-      startAt: s.startAt,
-      endAt: s.endAt,
+      startAt: typeof s.startAt === 'string' ? s.startAt : undefined,
+      endAt: typeof s.endAt === 'string' ? s.endAt : undefined,
       rrule: typeof s.rrule === 'string' ? s.rrule.slice(0, 200) : undefined,
       daysOfWeek: recurring ? [...new Set<number>(s.daysOfWeek)] : undefined,
-      startTime: s.startTime,
-      endTime: s.endTime,
+      startTime: typeof s.startTime === 'string' ? s.startTime : undefined,
+      endTime: typeof s.endTime === 'string' ? s.endTime : undefined,
       timezone: typeof s.timezone === 'string' ? s.timezone : 'Asia/Seoul',
     });
   }
@@ -588,580 +571,533 @@ function sanitizeSessions(input: unknown): { sessions?: any[]; error?: string } 
 }
 
 // -------------------------------------------------------------
-// Domain helpers (server-side source of truth)
+// Domain helpers (the server is the source of truth)
 // -------------------------------------------------------------
 const ACTIVE_ASSIGNMENT_STATUSES = ['EMPLOYEE_PENDING', 'APPROVAL_PENDING', 'APPROVED'];
 
-function activeApprovers(): UserRecord[] {
-  // NOTE: "all approvers" is the current business rule (v1.0). Narrowing it to
-  // "project owner + the employee's department head" is an open product decision.
-  return db.users.filter((u) => u.role === 'APPROVER' && u.status === 'ACTIVE');
+/**
+ * "All approvers" is the current business rule (v1.0): every active APPROVER must approve.
+ * Narrowing it (e.g. project owner + the employee's department head) is an open product decision and
+ * would be changed only here.
+ */
+async function activeApprovers(q: Queryable): Promise<{ id: string }[]> {
+  return (await q.query(`SELECT id FROM users WHERE role = 'APPROVER' AND status = 'ACTIVE' ORDER BY id`)).rows;
 }
 
-/** Recomputes time conflicts for an employee on a project using stored data, never client input. */
-function serverConflicts(employeeId: string, projectId: string) {
-  const proj = db.projects.find((p) => p.id === projectId);
-  if (!proj) return { hasConflict: false, conflicts: [] as any[], pendingCount: 0 };
+/** Locks (FOR SHARE / FOR UPDATE) a project row. Lock order is always project first, then employees by id. */
+async function lockProject(q: Queryable, projectId: string, mode: 'SHARE' | 'UPDATE') {
+  await q.query(`SELECT id FROM projects WHERE id = $1 FOR ${mode}`, [projectId]);
+}
+
+/** Serialises schedule-affecting work for the given employees (conflict check + status change = one unit). */
+async function lockEmployees(q: Queryable, employeeIds: string[]) {
+  const ids = [...new Set(employeeIds)].sort();
+  if (ids.length) await q.query(`SELECT id FROM users WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE`, [ids]);
+}
+
+/**
+ * Recomputes time conflicts for an employee from stored data, never from client input.
+ * `proposedSessions` lets callers ask "what if this project had this schedule instead?".
+ */
+async function serverConflicts(q: Queryable, employeeId: string, projectId: string, proposedSessions?: SessionInput[]) {
+  const projRow = (await q.query(`SELECT * FROM projects WHERE id = $1`, [projectId])).rows[0];
+  if (!projRow) return { hasConflict: false, conflicts: [] as any[], pendingCount: 0 };
+  const proj = mapProject(projRow);
+
+  const asgRows = (await q.query(`SELECT * FROM assignments WHERE employee_id = $1`, [employeeId])).rows;
+  const projectIds = [...new Set([projectId, ...asgRows.map((a) => a.project_id)])];
+  const projRows = (await q.query(`SELECT * FROM projects WHERE id = ANY($1::text[])`, [projectIds])).rows;
+  const sessRows = (await q.query(`SELECT * FROM sessions WHERE project_id = ANY($1::text[]) ORDER BY project_id, position`, [projectIds])).rows;
+  const creatorIds = [...new Set(projRows.map((p) => p.created_by))];
+  const userRows = (await q.query(`SELECT * FROM users WHERE id = ANY($1::text[])`, [creatorIds])).rows;
+  const overlapRows = (await q.query(`SELECT * FROM allowed_overlaps WHERE employee_id = $1`, [employeeId])).rows;
+
+  const allSessions = sessRows.map(mapSession);
+  const targetSessions = proposedSessions
+    ? proposedSessions.map((s, i) => ({ ...s, id: `proposed-${i}`, projectId }))
+    : allSessions.filter((s) => s.projectId === projectId);
+
   return checkEmployeeOverlap(
     employeeId,
-    proj,
-    db.sessions.filter((s) => s.projectId === projectId),
-    db.projects,
-    db.sessions,
-    db.assignments,
-    db.allowedOverlaps,
-    db.users as any,
+    proj as any,
+    targetSessions as any,
+    projRows.map(mapProject) as any,
+    allSessions as any,
+    asgRows.map((a) => mapAssignment(a)) as any,
+    overlapRows.map(mapAllowedOverlap) as any,
+    userRows.map((u) => mapUser(u)) as any,
     projectId
   );
 }
 
-function notify(recipientId: string, type: string, title: string, message: string, linkTab: string) {
-  db.notifications.unshift({
-    id: newId('noti'),
-    recipientId,
-    type,
-    title,
-    message,
-    read: false,
-    linkTab,
-    createdAt: new Date().toISOString(),
-  });
-  // Mirror to Slack so people do not have to open the app to learn that something awaits them.
-  const recipient = db.users.find((u) => u.id === recipientId);
-  if (recipient?.status === 'ACTIVE') notifyDM(recipient.email, title, message);
+async function recordAllowedOverlaps(q: Queryable, employeeId: string, conflicts: any[], source: string, sourceId: string) {
+  for (const c of conflicts) {
+    await q.query(
+      `INSERT INTO allowed_overlaps (id, employee_id, session_a_id, session_b_id, source, source_id) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [newId('ao'), employeeId, c.targetSession?.sessionId || '', c.conflictingSession?.sessionId || '', source, sourceId]
+    );
+  }
+}
+
+async function insertSessions(q: Queryable, projectId: string, list: SessionInput[]) {
+  let position = 0;
+  for (const s of list) {
+    await q.query(
+      `INSERT INTO sessions (id, project_id, position, title, start_at, end_at, rrule, days_of_week, start_time, end_time, timezone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [newId('sess'), projectId, position++, s.title, s.startAt ?? null, s.endAt ?? null, s.rrule ?? null, s.daysOfWeek ?? null, s.startTime ?? null, s.endTime ?? null, s.timezone]
+    );
+  }
+}
+
+async function replaceSessions(q: Queryable, projectId: string, list: SessionInput[]) {
+  await q.query(`DELETE FROM sessions WHERE project_id = $1`, [projectId]);
+  await insertSessions(q, projectId, list);
+}
+
+async function getProject(q: Queryable, id: string, lock?: 'SHARE' | 'UPDATE') {
+  const r = await q.query(`SELECT * FROM projects WHERE id = $1 ${lock ? `FOR ${lock}` : ''}`, [id]);
+  if (!r.rows[0]) throw fail(404, '프로젝트를 찾을 수 없습니다.');
+  return mapProject(r.rows[0]);
+}
+
+async function getAssignment(q: Queryable, id: string, lock = false) {
+  const r = await q.query(`SELECT * FROM assignments WHERE id = $1 ${lock ? 'FOR UPDATE' : ''}`, [id]);
+  if (!r.rows[0]) throw fail(404, '배정 내역을 찾을 수 없습니다.');
+  return r.rows[0];
+}
+
+async function assignmentView(q: Queryable, id: string) {
+  const a = (await q.query(`SELECT * FROM assignments WHERE id = $1`, [id])).rows[0];
+  const d = (await q.query(`SELECT * FROM approval_decisions WHERE assignment_id = $1 ORDER BY id`, [id])).rows;
+  return mapAssignment(a, d);
 }
 
 // 8. Projects: Create Project (Approver only)
-app.post('/api/projects', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/projects', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'APPROVER') {
-    return res.status(403).json({ error: '프로젝트 등록은 허가권자만 가능합니다.' });
-  }
+  if (user.role !== 'APPROVER') throw fail(403, '프로젝트 등록은 허가권자만 가능합니다.');
 
   const p = sanitizeProjectFields(req.body?.project, false);
-  if (p.error) return res.status(400).json({ error: p.error });
-  if (p.fields!.startDate > p.fields!.endDate) return res.status(400).json({ error: '종료일은 시작일 이후여야 합니다.' });
+  if (p.error) throw fail(400, p.error);
+  if (p.fields!.startDate > p.fields!.endDate) throw fail(400, '종료일은 시작일 이후여야 합니다.');
   const s = sanitizeSessions(req.body?.sessions ?? []);
-  if (s.error) return res.status(400).json({ error: s.error });
+  if (s.error) throw fail(400, s.error);
 
+  const f = p.fields!;
   const projectId = newId('proj');
-  const now = new Date().toISOString();
-  const newProject: any = { ...p.fields, id: projectId, createdBy: user.id, createdAt: now, updatedAt: now };
-  const newSessions = s.sessions!.map((x) => ({ ...x, id: newId('sess'), projectId }));
+  await transact(async ({ q }) => {
+    await q.query(
+      `INSERT INTO projects (id, name, description, created_by, start_date, end_date, status, headcount, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [projectId, f.name, f.description, user.id, f.startDate, f.endDate, f.status, f.headcount ?? null, f.color]
+    );
+    await insertSessions(q, projectId, s.sessions!);
+    await logAudit(q, user, 'CREATE_PROJECT', 'PROJECT', projectId, `신규 프로젝트 [${f.name}] 등록`);
+  });
 
-  db.projects.unshift(newProject);
-  db.sessions.push(...newSessions);
-  saveDB(db);
-
-  logAudit(user, 'CREATE_PROJECT', 'PROJECT', projectId, `신규 프로젝트 [${newProject.name}] 등록`);
-  res.json({ success: true, project: newProject, sessions: newSessions });
-});
+  const project = mapProject((await db.query(`SELECT * FROM projects WHERE id = $1`, [projectId])).rows[0]);
+  const sessions = (await db.query(`SELECT * FROM sessions WHERE project_id = $1 ORDER BY position`, [projectId])).rows.map(mapSession);
+  res.json({ success: true, project, sessions });
+}));
 
 // 9. Projects: Update Project Metadata (whitelisted fields only)
-app.patch('/api/projects/:id', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.patch('/api/projects/:id', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  const proj = db.projects.find((p) => p.id === req.params.id);
-  if (!proj) return res.status(404).json({ error: '프로젝트를 찾을 수 없습니다.' });
-
-  if (proj.createdBy !== user.id && user.role !== 'ADMIN') {
-    return res.status(403).json({ error: '자신이 등록한 프로젝트만 수정할 수 있습니다.' });
-  }
-
   const p = sanitizeProjectFields(req.body, true);
-  if (p.error) return res.status(400).json({ error: p.error });
-  const next = { ...proj, ...p.fields };
-  if (next.startDate > next.endDate) return res.status(400).json({ error: '종료일은 시작일 이후여야 합니다.' });
+  if (p.error) throw fail(400, p.error);
 
-  Object.assign(proj, p.fields, { updatedAt: new Date().toISOString() });
-  saveDB(db);
+  const project = await transact(async ({ q }) => {
+    const proj = await getProject(q, req.params.id, 'UPDATE');
+    if (proj.createdBy !== user.id && user.role !== 'ADMIN') throw fail(403, '자신이 등록한 프로젝트만 수정할 수 있습니다.');
+    const next = { ...proj, ...p.fields };
+    if (next.startDate > next.endDate) throw fail(400, '종료일은 시작일 이후여야 합니다.');
 
-  logAudit(user, 'UPDATE_PROJECT', 'PROJECT', proj.id, `[${proj.name}] 정보 수정`);
-  res.json({ success: true, project: proj });
-});
+    await q.query(
+      `UPDATE projects SET name=$2, description=$3, start_date=$4, end_date=$5, status=$6, headcount=$7, color=$8, updated_at=now() WHERE id=$1`,
+      [proj.id, next.name, next.description, next.startDate, next.endDate, next.status, next.headcount ?? null, next.color]
+    );
+    await logAudit(q, user, 'UPDATE_PROJECT', 'PROJECT', proj.id, `[${next.name}] 정보 수정`);
+    return mapProject((await q.query(`SELECT * FROM projects WHERE id = $1`, [proj.id])).rows[0]);
+  });
+  res.json({ success: true, project });
+}));
 
 // 10. Assignments: Assign
-app.post('/api/assignments', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/assignments', authMiddleware, route(async (req, res) => {
   const user = req.user!;
   const { projectId, employeeId, confirmOverlap } = req.body ?? {};
+  if (user.role !== 'APPROVER') throw fail(403, '배정은 허가권자만 할 수 있습니다.');
+  if (typeof projectId !== 'string' || typeof employeeId !== 'string') throw fail(400, '프로젝트와 직원을 지정하세요.');
 
-  if (user.role !== 'APPROVER') return res.status(403).json({ error: '배정은 허가권자만 할 수 있습니다.' });
+  const assignment = await transact(async (c) => {
+    const { q } = c;
+    const proj = await getProject(q, projectId, 'SHARE');
+    if (proj.createdBy !== user.id) throw fail(403, '자신이 등록한 프로젝트에만 배정할 수 있습니다.');
+    if (proj.status === 'CANCELLED' || proj.status === 'COMPLETED') throw fail(400, '종료되었거나 취소된 프로젝트에는 배정할 수 없습니다.');
 
-  const proj = db.projects.find((p) => p.id === projectId);
-  if (!proj) return res.status(404).json({ error: '프로젝트를 찾을 수 없습니다.' });
-  if (proj.createdBy !== user.id) {
-    return res.status(403).json({ error: '자신이 등록한 프로젝트에만 배정할 수 있습니다.' });
-  }
-  if (proj.status === 'CANCELLED' || proj.status === 'COMPLETED') {
-    return res.status(400).json({ error: '종료되었거나 취소된 프로젝트에는 배정할 수 없습니다.' });
-  }
+    await lockEmployees(q, [employeeId]);
+    const target = (await q.query(`SELECT * FROM users WHERE id = $1`, [employeeId])).rows[0];
+    if (!target || target.status !== 'ACTIVE' || target.role === 'ADMIN') throw fail(400, '활성 상태의 직원만 배정할 수 있습니다.');
 
-  const targetEmp = db.users.find((u) => u.id === employeeId);
-  if (!targetEmp || targetEmp.status !== 'ACTIVE' || targetEmp.role === 'ADMIN') {
-    return res.status(400).json({ error: '활성 상태의 직원만 배정할 수 있습니다.' });
-  }
-  if (db.assignments.some((a) => a.projectId === projectId && a.employeeId === employeeId && ACTIVE_ASSIGNMENT_STATUSES.includes(a.status))) {
-    return res.status(409).json({ error: '이미 해당 프로젝트에 배정(또는 진행 중)인 직원입니다.' });
-  }
+    const assignmentId = newId('asg');
 
-  const now = new Date().toISOString();
-  const assignmentId = newId('asg');
-
-  // Self Assign: instantly confirmed, but overlapping time must be explicitly acknowledged.
-  if (employeeId === user.id) {
-    const check = serverConflicts(user.id, projectId);
-    if (check.hasConflict && !confirmOverlap) {
-      return res.status(409).json({
-        error: '다른 확정 프로젝트와 시간이 겹칩니다. 경고 확인 후 투입을 확정할 수 있습니다.',
-        needConfirmation: true,
-        conflicts: check.conflicts,
-      });
+    // Self Assign: instantly confirmed, but overlapping time must be explicitly acknowledged.
+    if (employeeId === user.id) {
+      const check = await serverConflicts(q, user.id, projectId);
+      if (check.hasConflict && !confirmOverlap) {
+        throw fail(409, '다른 확정 프로젝트와 시간이 겹칩니다. 경고 확인 후 투입을 확정할 수 있습니다.', {
+          needConfirmation: true,
+          conflicts: check.conflicts,
+        });
+      }
+      await insertAssignment(q, { id: assignmentId, projectId, employeeId, assignedBy: user.id, type: 'SELF', status: 'APPROVED' });
+      await recordAllowedOverlaps(q, user.id, check.conflicts, 'SELF_ASSIGN', assignmentId); // from server-computed conflicts
+      await logAudit(q, user, 'SELF_ASSIGN', 'ASSIGNMENT', assignmentId, `[${proj.name}] 셀프 투입 확정`);
+      return assignmentView(q, assignmentId);
     }
 
-    const newAsg = {
+    const isApproverTarget = target.role === 'APPROVER';
+    await insertAssignment(q, {
       id: assignmentId,
       projectId,
       employeeId,
       assignedBy: user.id,
-      type: 'SELF',
-      status: 'APPROVED',
-      createdAt: now,
-      updatedAt: now,
-      approvalDecisions: [],
-    };
-    db.assignments.unshift(newAsg);
-
-    // The allowed overlaps are recorded from the server-computed conflicts.
-    check.conflicts.forEach((c: any) => {
-      db.allowedOverlaps.push({
-        id: newId('ao'),
-        employeeId: user.id,
-        sessionAId: c.targetSession?.sessionId || '',
-        sessionBId: c.conflictingSession?.sessionId || '',
-        source: 'SELF_ASSIGN',
-        sourceId: assignmentId,
-        createdAt: now,
-      });
+      type: isApproverTarget ? 'APPROVER' : 'EMPLOYEE',
+      status: 'EMPLOYEE_PENDING',
     });
+    if (!isApproverTarget) {
+      for (const a of await activeApprovers(q)) {
+        await q.query(`INSERT INTO approval_decisions (id, assignment_id, approver_id, decision) VALUES ($1,$2,$3,'PENDING')`, [newId('dec'), assignmentId, a.id]);
+      }
+    }
 
-    logAudit(user, 'SELF_ASSIGN', 'ASSIGNMENT', assignmentId, `[${proj.name}] 셀프 투입 확정`);
-    return res.json({ success: true, assignment: newAsg });
-  }
+    await notify(c, employeeId, 'ASSIGNED', '프로젝트 배정 요청', `${user.name}님이 [${proj.name}] 프로젝트에 배정하였습니다. 수락 여부를 결정해 주세요.`, 'inbox');
+    await logAudit(q, user, isApproverTarget ? 'ASSIGN_APPROVER' : 'ASSIGN_EMPLOYEE', 'ASSIGNMENT', assignmentId, `[${proj.name}]에 ${isApproverTarget ? '허가권자' : '일반 직원'} ${target.name} 배정`);
+    return assignmentView(q, assignmentId);
+  }).catch((e) => {
+    // The partial unique index is the last line of defence against a duplicate live assignment.
+    if (isUniqueViolation(e)) throw fail(409, '이미 해당 프로젝트에 배정(또는 진행 중)인 직원입니다.');
+    throw e;
+  });
+  res.json({ success: true, assignment });
+}));
 
-  const isApproverTarget = targetEmp.role === 'APPROVER';
-  const newAsg = {
-    id: assignmentId,
-    projectId,
-    employeeId,
-    assignedBy: user.id,
-    type: isApproverTarget ? 'APPROVER' : 'EMPLOYEE',
-    status: 'EMPLOYEE_PENDING',
-    createdAt: now,
-    updatedAt: now,
-    approvalDecisions: isApproverTarget
-      ? []
-      : activeApprovers().map((a) => ({
-          id: newId('dec'),
-          assignmentId,
-          approverId: a.id,
-          decision: 'PENDING',
-        })),
-  };
-  db.assignments.unshift(newAsg);
-
-  notify(
-    employeeId,
-    'ASSIGNED',
-    '프로젝트 배정 요청',
-    `${user.name}님이 [${proj.name}] 프로젝트에 배정하였습니다. 수락 여부를 결정해 주세요.`,
-    'inbox'
-  );
-
-  logAudit(
-    user,
-    isApproverTarget ? 'ASSIGN_APPROVER' : 'ASSIGN_EMPLOYEE',
-    'ASSIGNMENT',
-    assignmentId,
-    `[${proj.name}]에 ${isApproverTarget ? '허가권자' : '일반 직원'} ${targetEmp.name} 배정`
-  );
-  res.json({ success: true, assignment: newAsg });
-});
+async function insertAssignment(
+  q: Queryable,
+  a: { id: string; projectId: string; employeeId: string; assignedBy: string; type: string; status: string }
+) {
+  await q.query(`INSERT INTO assignments (id, project_id, employee_id, assigned_by, type, status) VALUES ($1,$2,$3,$4,$5,$6)`, [
+    a.id,
+    a.projectId,
+    a.employeeId,
+    a.assignedBy,
+    a.type,
+    a.status,
+  ]);
+}
 
 // 11. Assignments: Respond (Accept / Decline)
-app.post('/api/assignments/:id/response', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/assignments/:id/response', authMiddleware, route(async (req, res) => {
   const user = req.user!;
   const { accept, declineReason } = req.body ?? {};
-  const asg = db.assignments.find((a) => a.id === req.params.id);
 
-  if (!asg) return res.status(404).json({ error: '배정 내역을 찾을 수 없습니다.' });
-  if (asg.employeeId !== user.id) {
-    return res.status(403).json({ error: '본인에게 할당된 배정만 수락/거절할 수 있습니다.' });
-  }
-  if (asg.status !== 'EMPLOYEE_PENDING') {
-    return res.status(409).json({ error: '수락 대기 상태의 배정만 응답할 수 있습니다.' });
-  }
+  const assignment = await transact(async (c) => {
+    const { q } = c;
+    const peek = await getAssignment(q, req.params.id);
+    if (peek.employee_id !== user.id) throw fail(403, '본인에게 할당된 배정만 수락/거절할 수 있습니다.');
 
-  const proj = db.projects.find((p) => p.id === asg.projectId);
-  const now = new Date().toISOString();
+    await lockProject(q, peek.project_id, 'SHARE');
+    await lockEmployees(q, [peek.employee_id]);
+    const asg = await getAssignment(q, req.params.id, true);
+    if (asg.status !== 'EMPLOYEE_PENDING') throw fail(409, '수락 대기 상태의 배정만 응답할 수 있습니다.');
+    const proj = await getProject(q, asg.project_id);
 
-  if (!accept) {
-    const reason = typeof declineReason === 'string' && declineReason.trim() ? declineReason.trim().slice(0, 500) : '개인 사정으로 인한 거절';
-    asg.status = 'DECLINED';
-    asg.declineReason = reason;
-    asg.updatedAt = now;
-
-    notify(asg.assignedBy, 'DECLINED', '배정 거절 알림', `${user.name}님이 [${proj?.name}] 배정을 거절하였습니다. 사유: ${reason}`, 'projects');
-    logAudit(user, 'DECLINE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `직원 ${user.name} 배정 거절`);
-    return res.json({ success: true, assignment: asg });
-  }
-
-  // Accepted: approver-to-approver assignments are confirmed immediately, but never over a conflict.
-  const check = serverConflicts(asg.employeeId, asg.projectId);
-  if (asg.type === 'APPROVER') {
-    if (check.hasConflict && !req.body?.confirmOverlap) {
-      return res.status(409).json({
-        error: '다른 확정 프로젝트와 시간이 겹칩니다. 겹침을 확인한 뒤 수락하세요.',
-        needConfirmation: true,
-        conflicts: check.conflicts,
-      });
+    if (!accept) {
+      const reason = typeof declineReason === 'string' && declineReason.trim() ? declineReason.trim().slice(0, 500) : '개인 사정으로 인한 거절';
+      await q.query(`UPDATE assignments SET status='DECLINED', decline_reason=$2, updated_at=now() WHERE id=$1`, [asg.id, reason]);
+      await notify(c, asg.assigned_by, 'DECLINED', '배정 거절 알림', `${user.name}님이 [${proj.name}] 배정을 거절하였습니다. 사유: ${reason}`, 'projects');
+      await logAudit(q, user, 'DECLINE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `직원 ${user.name} 배정 거절`);
+      return assignmentView(q, asg.id);
     }
-    asg.status = 'APPROVED';
-    asg.updatedAt = now;
-    check.conflicts.forEach((c: any) => {
-      db.allowedOverlaps.push({
-        id: newId('ao'),
-        employeeId: asg.employeeId,
-        sessionAId: c.targetSession?.sessionId || '',
-        sessionBId: c.conflictingSession?.sessionId || '',
-        source: 'APPROVER_ACCEPT',
-        sourceId: asg.id,
-        createdAt: now,
-      });
-    });
 
-    notify(asg.assignedBy, 'ACCEPTED', '배정 수락 및 최종 확정', `허가권자 ${user.name}님이 [${proj?.name}] 배정을 수락하여 참여가 최종 확정되었습니다.`, 'calendar');
-    logAudit(user, 'APPROVER_ACCEPT', 'ASSIGNMENT', asg.id, `허가권자 ${user.name} 수락으로 [${proj?.name}] 확정`);
-    return res.json({ success: true, assignment: asg });
-  }
+    // Accepted: approver-to-approver assignments are confirmed immediately, but never silently over a conflict.
+    if (asg.type === 'APPROVER') {
+      const check = await serverConflicts(q, asg.employee_id, asg.project_id);
+      if (check.hasConflict && !req.body?.confirmOverlap) {
+        throw fail(409, '다른 확정 프로젝트와 시간이 겹칩니다. 겹침을 확인한 뒤 수락하세요.', { needConfirmation: true, conflicts: check.conflicts });
+      }
+      await q.query(`UPDATE assignments SET status='APPROVED', updated_at=now() WHERE id=$1`, [asg.id]);
+      await recordAllowedOverlaps(q, asg.employee_id, check.conflicts, 'APPROVER_ACCEPT', asg.id);
+      await notify(c, asg.assigned_by, 'ACCEPTED', '배정 수락 및 최종 확정', `허가권자 ${user.name}님이 [${proj.name}] 배정을 수락하여 참여가 최종 확정되었습니다.`, 'calendar');
+      await logAudit(q, user, 'APPROVER_ACCEPT', 'ASSIGNMENT', asg.id, `허가권자 ${user.name} 수락으로 [${proj.name}] 확정`);
+      return assignmentView(q, asg.id);
+    }
 
-  // General employee: move to the all-approver approval stage.
-  asg.status = 'APPROVAL_PENDING';
-  asg.updatedAt = now;
-
-  asg.approvalDecisions.forEach((d: any) => {
-    notify(d.approverId, 'APPROVAL_REQUEST', '배정 승인 요청', `[${proj?.name}]에 ${user.name} 직원이 배정을 수락하여 허가권자 승인이 필요합니다.`, 'inbox');
+    // General employee: move to the all-approver approval stage.
+    await q.query(`UPDATE assignments SET status='APPROVAL_PENDING', updated_at=now() WHERE id=$1`, [asg.id]);
+    const decs = (await q.query(`SELECT approver_id FROM approval_decisions WHERE assignment_id = $1`, [asg.id])).rows;
+    for (const d of decs) {
+      await notify(c, d.approver_id, 'APPROVAL_REQUEST', '배정 승인 요청', `[${proj.name}]에 ${user.name} 직원이 배정을 수락하여 허가권자 승인이 필요합니다.`, 'inbox');
+    }
+    await logAudit(q, user, 'EMPLOYEE_ACCEPT', 'ASSIGNMENT', asg.id, `직원 ${user.name} 수락으로 허가권자 전원 승인 대기`);
+    return assignmentView(q, asg.id);
   });
-
-  logAudit(user, 'EMPLOYEE_ACCEPT', 'ASSIGNMENT', asg.id, `직원 ${user.name} 수락으로 허가권자 전원 승인 대기`);
-  res.json({ success: true, assignment: asg });
-});
+  res.json({ success: true, assignment });
+}));
 
 // 12. Assignments: Approver Decision (Approve / Reject)
-app.post('/api/assignments/:id/decision', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/assignments/:id/decision', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'APPROVER') {
-    return res.status(403).json({ error: '허가권자만 승인 또는 반려할 수 있습니다.' });
-  }
-
+  if (user.role !== 'APPROVER') throw fail(403, '허가권자만 승인 또는 반려할 수 있습니다.');
   const { decision, comment } = req.body ?? {};
-  if (decision !== 'APPROVED' && decision !== 'REJECTED') {
-    return res.status(400).json({ error: '결정 값이 올바르지 않습니다.' });
-  }
-  const asg = db.assignments.find((a) => a.id === req.params.id);
-  if (!asg) return res.status(404).json({ error: '배정 내역을 찾을 수 없습니다.' });
-  if (asg.status !== 'APPROVAL_PENDING') {
-    return res.status(409).json({ error: '승인 대기 상태의 배정만 승인/반려할 수 있습니다.' });
-  }
-
-  const myDec = asg.approvalDecisions.find((d: any) => d.approverId === user.id);
-  if (!myDec) return res.status(403).json({ error: '이 배정의 승인 대상 허가권자가 아닙니다.' });
-  if (myDec.decision !== 'PENDING') return res.status(409).json({ error: '이미 결정을 내린 건입니다.' });
-
-  const proj = db.projects.find((p) => p.id === asg.projectId);
-  const targetEmp = db.users.find((u) => u.id === asg.employeeId);
-  const now = new Date().toISOString();
+  if (decision !== 'APPROVED' && decision !== 'REJECTED') throw fail(400, '결정 값이 올바르지 않습니다.');
   const note = typeof comment === 'string' ? comment.trim().slice(0, 500) : '';
 
-  if (decision === 'REJECTED') {
-    if (!note) return res.status(400).json({ error: '반려 시에는 반려 사유를 필수로 입력해야 합니다.' });
+  const assignment = await transact(async (c) => {
+    const { q } = c;
+    const peek = await getAssignment(q, req.params.id);
+    await lockProject(q, peek.project_id, 'SHARE');
+    await lockEmployees(q, [peek.employee_id]);
+    const asg = await getAssignment(q, req.params.id, true);
+    if (asg.status !== 'APPROVAL_PENDING') throw fail(409, '승인 대기 상태의 배정만 승인/반려할 수 있습니다.');
 
-    asg.status = 'REJECTED';
-    asg.declineReason = `허가권자 ${user.name} 반려: ${note}`;
-    asg.updatedAt = now;
-    myDec.decision = 'REJECTED';
-    myDec.comment = note;
-    myDec.decidedAt = now;
+    const my = (await q.query(`SELECT * FROM approval_decisions WHERE assignment_id = $1 AND approver_id = $2 FOR UPDATE`, [asg.id, user.id])).rows[0];
+    if (!my) throw fail(403, '이 배정의 승인 대상 허가권자가 아닙니다.');
+    if (my.decision !== 'PENDING') throw fail(409, '이미 결정을 내린 건입니다.');
 
-    notify(asg.employeeId, 'REJECTED', '프로젝트 배정 반려', `[${proj?.name}] 배정 건이 ${user.name} 부서장에 의해 반려되었습니다. 사유: ${note}`, 'inbox');
-    logAudit(user, 'REJECT_ASSIGNMENT', 'ASSIGNMENT', asg.id, `${targetEmp?.name} 배정 반려 (사유: ${note})`);
-    return res.json({ success: true, assignment: asg });
-  }
+    const proj = await getProject(q, asg.project_id);
+    const target = (await q.query(`SELECT name FROM users WHERE id = $1`, [asg.employee_id])).rows[0];
 
-  // Approval is blocked while the employee still has an unresolved time conflict.
-  const check = serverConflicts(asg.employeeId, asg.projectId);
-  if (check.hasConflict) {
-    return res.status(409).json({
-      error: '직원의 다른 확정 프로젝트와 시간이 겹쳐 승인할 수 없습니다. 반려하거나 일정 조정 후 다시 시도하세요.',
-      conflicts: check.conflicts,
-    });
-  }
+    if (decision === 'REJECTED') {
+      if (!note) throw fail(400, '반려 시에는 반려 사유를 필수로 입력해야 합니다.');
+      await q.query(`UPDATE assignments SET status='REJECTED', decline_reason=$2, updated_at=now() WHERE id=$1`, [asg.id, `허가권자 ${user.name} 반려: ${note}`]);
+      await q.query(`UPDATE approval_decisions SET decision='REJECTED', comment=$2, decided_at=now() WHERE id=$1`, [my.id, note]);
+      await notify(c, asg.employee_id, 'REJECTED', '프로젝트 배정 반려', `[${proj.name}] 배정 건이 ${user.name} 부서장에 의해 반려되었습니다. 사유: ${note}`, 'inbox');
+      await logAudit(q, user, 'REJECT_ASSIGNMENT', 'ASSIGNMENT', asg.id, `${target?.name} 배정 반려 (사유: ${note})`);
+      return assignmentView(q, asg.id);
+    }
 
-  myDec.decision = 'APPROVED';
-  myDec.comment = note || undefined;
-  myDec.decidedAt = now;
+    // Approval is blocked while the employee still has an unresolved time conflict.
+    const check = await serverConflicts(q, asg.employee_id, asg.project_id);
+    if (check.hasConflict) {
+      throw fail(409, '직원의 다른 확정 프로젝트와 시간이 겹쳐 승인할 수 없습니다. 반려하거나 일정 조정 후 다시 시도하세요.', { conflicts: check.conflicts });
+    }
 
-  const allApproved = asg.approvalDecisions.every((d: any) => d.decision === 'APPROVED');
-  if (allApproved) {
-    asg.status = 'APPROVED';
-    asg.updatedAt = now;
-    notify(asg.employeeId, 'APPROVED', '프로젝트 참여 확정!', `[${proj?.name}] 프로젝트 배정이 허가권자 전원의 승인을 받아 최종 확정되었습니다!`, 'calendar');
-    logAudit(user, 'FINAL_APPROVE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `전원 승인 달성으로 ${targetEmp?.name} 참여 최종 확정`);
-  } else {
-    logAudit(user, 'APPROVE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `허가권자 ${user.name} 승인 완료 (타 허가권자 대기)`);
-  }
-
-  res.json({ success: true, assignment: asg });
-});
+    await q.query(`UPDATE approval_decisions SET decision='APPROVED', comment=$2, decided_at=now() WHERE id=$1`, [my.id, note || null]);
+    const open = (await q.query(`SELECT count(*)::int AS n FROM approval_decisions WHERE assignment_id = $1 AND decision <> 'APPROVED'`, [asg.id])).rows[0].n;
+    if (open === 0) {
+      await q.query(`UPDATE assignments SET status='APPROVED', updated_at=now() WHERE id=$1`, [asg.id]);
+      await notify(c, asg.employee_id, 'APPROVED', '프로젝트 참여 확정!', `[${proj.name}] 프로젝트 배정이 허가권자 전원의 승인을 받아 최종 확정되었습니다!`, 'calendar');
+      await logAudit(q, user, 'FINAL_APPROVE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `전원 승인 달성으로 ${target?.name} 참여 최종 확정`);
+    } else {
+      await logAudit(q, user, 'APPROVE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `허가권자 ${user.name} 승인 완료 (타 허가권자 대기)`);
+    }
+    return assignmentView(q, asg.id);
+  });
+  res.json({ success: true, assignment });
+}));
 
 // 13. Assignments: Withdraw (before confirmation)
-app.post('/api/assignments/:id/withdraw', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/assignments/:id/withdraw', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  const asg = db.assignments.find((a) => a.id === req.params.id);
-  if (!asg) return res.status(404).json({ error: '배정 내역을 찾을 수 없습니다.' });
+  await transact(async (c) => {
+    const { q } = c;
+    const asg = await getAssignment(q, req.params.id, true);
+    const proj = await getProject(q, asg.project_id);
+    if (proj.createdBy !== user.id) throw fail(403, '등록한 허가권자만 배정을 취소할 수 있습니다.');
+    if (asg.status !== 'EMPLOYEE_PENDING' && asg.status !== 'APPROVAL_PENDING') throw fail(409, '확정 전(대기 중)인 배정만 철회할 수 있습니다.');
 
-  const proj = db.projects.find((p) => p.id === asg.projectId);
-  if (proj?.createdBy !== user.id) {
-    return res.status(403).json({ error: '등록한 허가권자만 배정을 취소할 수 있습니다.' });
-  }
-  if (asg.status !== 'EMPLOYEE_PENDING' && asg.status !== 'APPROVAL_PENDING') {
-    return res.status(409).json({ error: '확정 전(대기 중)인 배정만 철회할 수 있습니다.' });
-  }
-
-  asg.status = 'WITHDRAWN';
-  asg.updatedAt = new Date().toISOString();
-  notify(asg.employeeId, 'WITHDRAWN', '배정 철회', `[${proj?.name}] 배정이 ${user.name}님에 의해 철회되었습니다.`, 'inbox');
-  logAudit(user, 'WITHDRAW_ASSIGNMENT', 'ASSIGNMENT', asg.id, `[${proj?.name}] 배정 철회`);
+    await q.query(`UPDATE assignments SET status='WITHDRAWN', updated_at=now() WHERE id=$1`, [asg.id]);
+    await notify(c, asg.employee_id, 'WITHDRAWN', '배정 철회', `[${proj.name}] 배정이 ${user.name}님에 의해 철회되었습니다.`, 'inbox');
+    await logAudit(q, user, 'WITHDRAW_ASSIGNMENT', 'ASSIGNMENT', asg.id, `[${proj.name}] 배정 철회`);
+  });
   res.json({ success: true });
-});
+}));
 
 // 14. Assignments: Release (after confirmation)
-app.post('/api/assignments/:id/release', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/assignments/:id/release', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  const asg = db.assignments.find((a) => a.id === req.params.id);
-  if (!asg) return res.status(404).json({ error: '배정 내역을 찾을 수 없습니다.' });
+  await transact(async (c) => {
+    const { q } = c;
+    const asg = await getAssignment(q, req.params.id, true);
+    const proj = await getProject(q, asg.project_id);
+    if (proj.createdBy !== user.id) throw fail(403, '등록한 허가권자만 참여를 해제할 수 있습니다.');
+    if (asg.status !== 'APPROVED') throw fail(409, '확정된 참여만 해제할 수 있습니다.');
 
-  const proj = db.projects.find((p) => p.id === asg.projectId);
-  if (proj?.createdBy !== user.id) {
-    return res.status(403).json({ error: '등록한 허가권자만 참여를 해제할 수 있습니다.' });
-  }
-  if (asg.status !== 'APPROVED') {
-    return res.status(409).json({ error: '확정된 참여만 해제할 수 있습니다.' });
-  }
-
-  asg.status = 'RELEASED';
-  asg.updatedAt = new Date().toISOString();
-  notify(asg.employeeId, 'RELEASED', '참여 해제', `[${proj?.name}] 참여가 ${user.name}님에 의해 해제되었습니다.`, 'calendar');
-  logAudit(user, 'RELEASE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `[${proj?.name}]에서 참여 해제`);
+    await q.query(`UPDATE assignments SET status='RELEASED', updated_at=now() WHERE id=$1`, [asg.id]);
+    await notify(c, asg.employee_id, 'RELEASED', '참여 해제', `[${proj.name}] 참여가 ${user.name}님에 의해 해제되었습니다.`, 'calendar');
+    await logAudit(q, user, 'RELEASE_ASSIGNMENT', 'ASSIGNMENT', asg.id, `[${proj.name}]에서 참여 해제`);
+  });
   res.json({ success: true });
-});
+}));
 
 // 15. Schedule Sessions & Change Requests
-app.put('/api/projects/:id/sessions', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.put('/api/projects/:id/sessions', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  const proj = db.projects.find((p) => p.id === req.params.id);
-  if (!proj) return res.status(404).json({ error: '프로젝트를 찾을 수 없습니다.' });
-
-  if (proj.createdBy !== user.id) {
-    return res.status(403).json({ error: '자신이 등록한 프로젝트의 일정만 수정할 수 있습니다.' });
-  }
-
   const s = sanitizeSessions(req.body?.sessions);
-  if (s.error) return res.status(400).json({ error: s.error });
-  const now = new Date().toISOString();
+  if (s.error) throw fail(400, s.error);
+  const proposed = s.sessions!;
 
-  const replaceSessions = (projectId: string, list: any[]) => {
-    db.sessions = db.sessions.filter((x) => x.projectId !== projectId);
-    db.sessions.push(...list.map((x) => ({ ...x, id: newId('sess'), projectId })));
-  };
+  const result = await transact(async (c) => {
+    const { q } = c;
+    const proj = await getProject(q, req.params.id, 'UPDATE');
+    if (proj.createdBy !== user.id) throw fail(403, '자신이 등록한 프로젝트의 일정만 수정할 수 있습니다.');
 
-  // Server-side decision on whether a change touches anyone else's schedule: never trust `directApply`.
-  const participants = db.assignments.filter((a) => a.projectId === proj.id && ACTIVE_ASSIGNMENT_STATUSES.includes(a.status));
-  const savedSessions = db.sessions;
-  const savedProposal = db.sessions.filter((x) => x.projectId !== proj.id).concat(s.sessions!.map((x) => ({ ...x, id: `proposed-${x.title}`, projectId: proj.id })));
-  let crossOwnerConflict = false;
-  try {
-    db.sessions = savedProposal;
-    crossOwnerConflict = participants.some((a) =>
-      serverConflicts(a.employeeId, proj.id).conflicts.some(
-        (c: any) => c.conflictingProject.createdBy !== user.id && a.employeeId !== user.id
-      )
-    );
-  } finally {
-    db.sessions = savedSessions;
-  }
+    const participants = (
+      await q.query(`SELECT DISTINCT employee_id FROM assignments WHERE project_id = $1 AND status = ANY($2::text[])`, [proj.id, ACTIVE_ASSIGNMENT_STATUSES])
+    ).rows.map((r) => r.employee_id as string);
+    await lockEmployees(q, participants);
 
-  if (!crossOwnerConflict) {
-    replaceSessions(proj.id, s.sessions!);
-    saveDB(db);
-    logAudit(user, 'UPDATE_SESSIONS_DIRECT', 'SESSION', proj.id, `[${proj.name}] 일정 변경 반영`);
-    return res.json({ success: true, appliedDirectly: true });
-  }
-
-  // Another approver's project overlaps: a change request with approval + consent is mandatory.
-  const decisions: any[] = [];
-  const requestId = newId('cr');
-  const conflictsList: any[] = [];
-  db.sessions = savedProposal;
-  try {
-    participants.forEach((a) => {
-      serverConflicts(a.employeeId, proj.id).conflicts.forEach((c: any) => {
-        if (c.conflictingProject.createdBy === user.id || a.employeeId === user.id) return;
-        conflictsList.push(c);
-        const ownerId = c.conflictingProject.createdBy;
-        if (!decisions.some((d) => d.actorId === ownerId && (d.kind === 'APPROVAL' || d.kind === 'BOTH'))) {
-          const ex = decisions.find((d) => d.actorId === ownerId);
-          if (ex) ex.kind = 'BOTH';
-          else decisions.push({ id: newId('cd'), changeRequestId: requestId, actorId: ownerId, kind: 'APPROVAL', decision: 'PENDING' });
-        }
-        const exE = decisions.find((d) => d.actorId === a.employeeId);
-        if (exE) {
-          if (exE.kind === 'APPROVAL') exE.kind = 'BOTH';
+    // Server-side decision on whether the change touches anyone else's schedule: `directApply` is never trusted.
+    const decisions: any[] = [];
+    const requestId = newId('cr');
+    const conflictsList: any[] = [];
+    for (const empId of participants) {
+      const check = await serverConflicts(q, empId, proj.id, proposed);
+      for (const cf of check.conflicts) {
+        if (cf.conflictingProject.createdBy === user.id || empId === user.id) continue;
+        conflictsList.push(cf);
+        const ownerId = cf.conflictingProject.createdBy;
+        const ownerDec = decisions.find((d) => d.actorId === ownerId);
+        if (!ownerDec) decisions.push({ id: newId('cd'), actorId: ownerId, kind: 'APPROVAL' });
+        const empDec = decisions.find((d) => d.actorId === empId);
+        if (empDec) {
+          if (empDec.kind === 'APPROVAL') empDec.kind = 'BOTH';
         } else {
-          decisions.push({ id: newId('cd'), changeRequestId: requestId, actorId: a.employeeId, kind: 'CONSENT', decision: 'PENDING' });
+          decisions.push({ id: newId('cd'), actorId: empId, kind: 'CONSENT' });
         }
-      });
-    });
-  } finally {
-    db.sessions = savedSessions;
-  }
+      }
+    }
 
-  const changeReq = {
-    id: requestId,
-    projectId: proj.id,
-    requestedBy: user.id,
-    proposedSessions: s.sessions,
-    conflicts: conflictsList,
-    status: 'CHANGE_PENDING',
-    createdAt: now,
-    decisions,
-  };
+    if (conflictsList.length === 0) {
+      await replaceSessions(q, proj.id, proposed);
+      await logAudit(q, user, 'UPDATE_SESSIONS_DIRECT', 'SESSION', proj.id, `[${proj.name}] 일정 변경 반영`);
+      return { appliedDirectly: true as const };
+    }
 
-  db.changeRequests.unshift(changeReq);
-  decisions.forEach((d) =>
-    notify(d.actorId, 'CHANGE_REQUEST', '일정 변경 승인/동의 요청', `[${proj.name}] 일정 변경에 대한 ${d.kind === 'CONSENT' ? '동의' : '승인'}가 필요합니다.`, 'inbox')
-  );
-  saveDB(db);
+    // Another approver's project overlaps: a change request with approval + consent is mandatory.
+    await q.query(`INSERT INTO change_requests (id, project_id, requested_by, proposed_sessions, conflicts, status) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,'CHANGE_PENDING')`, [
+      requestId,
+      proj.id,
+      user.id,
+      JSON.stringify(proposed),
+      JSON.stringify(conflictsList),
+    ]);
+    for (const d of decisions) {
+      await q.query(`INSERT INTO change_decisions (id, change_request_id, actor_id, kind, decision) VALUES ($1,$2,$3,$4,'PENDING')`, [d.id, requestId, d.actorId, d.kind]);
+      await notify(c, d.actorId, 'CHANGE_REQUEST', '일정 변경 승인/동의 요청', `[${proj.name}] 일정 변경에 대한 ${d.kind === 'CONSENT' ? '동의' : '승인'}가 필요합니다.`, 'inbox');
+    }
+    await logAudit(q, user, 'CREATE_CHANGE_REQUEST', 'CHANGE_REQUEST', requestId, `[${proj.name}] 일정 변경 요청 생성`);
 
-  logAudit(user, 'CREATE_CHANGE_REQUEST', 'CHANGE_REQUEST', requestId, `[${proj.name}] 일정 변경 요청 생성`);
-  res.json({ success: true, appliedDirectly: false, changeRequest: changeReq });
-});
+    const cr = (await q.query(`SELECT * FROM change_requests WHERE id = $1`, [requestId])).rows[0];
+    const cds = (await q.query(`SELECT * FROM change_decisions WHERE change_request_id = $1 ORDER BY id`, [requestId])).rows;
+    return { appliedDirectly: false as const, changeRequest: mapChangeRequest(cr, cds) };
+  });
+  res.json({ success: true, ...result });
+}));
 
 // 16. Change Request Decision
-app.post('/api/change-requests/:id/decision', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/change-requests/:id/decision', authMiddleware, route(async (req, res) => {
   const user = req.user!;
   const { decision, comment } = req.body ?? {};
-  if (decision !== 'APPROVED' && decision !== 'REJECTED') {
-    return res.status(400).json({ error: '결정 값이 올바르지 않습니다.' });
-  }
-  const cr = db.changeRequests.find((c) => c.id === req.params.id);
-  if (!cr) return res.status(404).json({ error: '요청을 찾을 수 없습니다.' });
-  if (cr.status !== 'CHANGE_PENDING') return res.status(409).json({ error: '진행 중인 변경 요청이 아닙니다.' });
-
-  const myDec = cr.decisions.find((d: any) => d.actorId === user.id);
-  if (!myDec) return res.status(403).json({ error: '본인에게 할당된 승인/동의 요청이 아닙니다.' });
-  if (myDec.decision !== 'PENDING') return res.status(409).json({ error: '이미 결정을 내린 건입니다.' });
-
-  const now = new Date().toISOString();
+  if (decision !== 'APPROVED' && decision !== 'REJECTED') throw fail(400, '결정 값이 올바르지 않습니다.');
   const note = typeof comment === 'string' ? comment.trim().slice(0, 500) : '';
 
-  if (decision === 'REJECTED') {
-    cr.status = 'CHANGE_REJECTED';
-    myDec.decision = 'REJECTED';
-    myDec.comment = note;
-    myDec.decidedAt = now;
-    notify(cr.requestedBy, 'CHANGE_REJECTED', '일정 변경 반려', `일정 변경 요청이 ${user.name}님에 의해 반려되었습니다.`, 'inbox');
-    logAudit(user, 'REJECT_CHANGE_REQUEST', 'CHANGE_REQUEST', cr.id, `일정 변경 반려 (사유: ${note || '미입력'})`);
-    return res.json({ success: true });
-  }
+  const result = await transact(async (c) => {
+    const { q } = c;
+    const crPeek = (await q.query(`SELECT project_id FROM change_requests WHERE id = $1`, [req.params.id])).rows[0];
+    if (!crPeek) throw fail(404, '요청을 찾을 수 없습니다.');
+    await lockProject(q, crPeek.project_id, 'UPDATE');
+    const cr = (await q.query(`SELECT * FROM change_requests WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+    if (cr.status !== 'CHANGE_PENDING') throw fail(409, '진행 중인 변경 요청이 아닙니다.');
 
-  myDec.decision = 'APPROVED';
-  myDec.comment = note;
-  myDec.decidedAt = now;
+    const my = (await q.query(`SELECT * FROM change_decisions WHERE change_request_id = $1 AND actor_id = $2 FOR UPDATE`, [cr.id, user.id])).rows[0];
+    if (!my) throw fail(403, '본인에게 할당된 승인/동의 요청이 아닙니다.');
+    if (my.decision !== 'PENDING') throw fail(409, '이미 결정을 내린 건입니다.');
 
-  const allApproved = cr.decisions.every((d: any) => d.decision === 'APPROVED');
-  if (allApproved) {
-    db.sessions = db.sessions.filter((x) => x.projectId !== cr.projectId);
-    db.sessions.push(...cr.proposedSessions.map((x: any) => ({ ...x, id: newId('sess'), projectId: cr.projectId })));
-    cr.status = 'CHANGE_APPROVED';
-    notify(cr.requestedBy, 'CHANGE_APPROVED', '일정 변경 승인', '일정 변경 요청이 최종 승인되어 캘린더에 반영되었습니다.', 'calendar');
-    logAudit(user, 'APPROVE_CHANGE_REQUEST_FINAL', 'CHANGE_REQUEST', cr.id, '일정 변경 최종 승인 및 캘린더 반영');
-  } else {
-    saveDB(db);
-  }
+    if (decision === 'REJECTED') {
+      await q.query(`UPDATE change_decisions SET decision='REJECTED', comment=$2, decided_at=now() WHERE id=$1`, [my.id, note]);
+      await q.query(`UPDATE change_requests SET status='CHANGE_REJECTED' WHERE id=$1`, [cr.id]);
+      await notify(c, cr.requested_by, 'CHANGE_REJECTED', '일정 변경 반려', `일정 변경 요청이 ${user.name}님에 의해 반려되었습니다.`, 'inbox');
+      await logAudit(q, user, 'REJECT_CHANGE_REQUEST', 'CHANGE_REQUEST', cr.id, `일정 변경 반려 (사유: ${note || '미입력'})`);
+      return {};
+    }
 
-  res.json({ success: true, allApproved });
-});
+    await q.query(`UPDATE change_decisions SET decision='APPROVED', comment=$2, decided_at=now() WHERE id=$1`, [my.id, note]);
+    const open = (await q.query(`SELECT count(*)::int AS n FROM change_decisions WHERE change_request_id = $1 AND decision <> 'APPROVED'`, [cr.id])).rows[0].n;
+    if (open > 0) return { allApproved: false };
+
+    // Everyone agreed: apply the proposed schedule. Participants are locked like any other schedule change.
+    const participants = (
+      await q.query(`SELECT DISTINCT employee_id FROM assignments WHERE project_id = $1 AND status = ANY($2::text[])`, [cr.project_id, ACTIVE_ASSIGNMENT_STATUSES])
+    ).rows.map((r) => r.employee_id as string);
+    await lockEmployees(q, participants);
+    await replaceSessions(q, cr.project_id, cr.proposed_sessions as SessionInput[]);
+    await q.query(`UPDATE change_requests SET status='CHANGE_APPROVED' WHERE id=$1`, [cr.id]);
+    await notify(c, cr.requested_by, 'CHANGE_APPROVED', '일정 변경 승인', '일정 변경 요청이 최종 승인되어 캘린더에 반영되었습니다.', 'calendar');
+    await logAudit(q, user, 'APPROVE_CHANGE_REQUEST_FINAL', 'CHANGE_REQUEST', cr.id, '일정 변경 최종 승인 및 캘린더 반영');
+    return { allApproved: true };
+  });
+  res.json({ success: true, ...result });
+}));
 
 // 17. Admin: Create Employee Account (invitation flow; no shared initial password)
-app.post('/api/admin/employees', authMiddleware, async (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/employees', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'ADMIN') {
-    return res.status(403).json({ error: '시스템 관리자만 계정을 발급할 수 있습니다.' });
-  }
+  if (user.role !== 'ADMIN') throw fail(403, '시스템 관리자만 계정을 발급할 수 있습니다.');
 
   const name = cleanStr(req.body?.name, 60);
   const email = cleanStr(req.body?.email, 200)?.toLowerCase();
-  if (!name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: '이름과 올바른 이메일을 입력하세요.' });
-  }
-  if (db.users.some((u) => u.email.toLowerCase() === email)) {
-    return res.status(400).json({ error: '이미 존재하는 이메일 계정입니다.' });
-  }
+  if (!name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail(400, '이름과 올바른 이메일을 입력하세요.');
   const departmentId = req.body?.departmentId;
-  if (!db.departments.some((d) => d.id === departmentId)) {
-    return res.status(400).json({ error: '존재하지 않는 부서입니다.' });
-  }
   const role = req.body?.role === 'APPROVER' || req.body?.role === 'ADMIN' ? req.body.role : 'EMPLOYEE';
 
   const salt = generateSalt();
-  const newEmp: UserRecord = {
-    id: newId('emp'),
-    email,
-    name,
-    departmentId,
-    role,
-    status: 'INVITED',
-    timezone: 'Asia/Seoul',
-    avatarColor: 'bg-emerald-600',
-    passwordSalt: salt,
-    // Random, unknown password: the account only becomes usable through the invitation link.
-    passwordHash: await hashPassword(crypto.randomBytes(32).toString('hex'), salt),
-    passwordIter: PBKDF2_ITER,
-  };
-  db.users.push(newEmp);
-  const { link, delivery } = await issueResetToken(newEmp, 72 * 60, 'invite');
+  // Random, unknown password: the account only becomes usable through the invitation link.
+  const hash = await hashPassword(crypto.randomBytes(32).toString('hex'), salt);
+  const id = newId('emp');
 
-  logAudit(user, 'CREATE_EMPLOYEE', 'EMPLOYEE', newEmp.id, `신규 직원 [${name} (${email})] 초대 (${delivery.ok ? delivery.channel : '발송 실패'})`);
+  await transact(async ({ q }) => {
+    const dept = await q.query(`SELECT id FROM departments WHERE id = $1`, [departmentId]);
+    if (typeof departmentId !== 'string' || dept.rows.length === 0) throw fail(400, '존재하지 않는 부서입니다.');
+    await q.query(
+      `INSERT INTO users (id, email, name, department_id, role, status, timezone, avatar_color, password_salt, password_hash, password_iter)
+       VALUES ($1,$2,$3,$4,$5,'INVITED','Asia/Seoul','bg-emerald-600',$6,$7,$8)`,
+      [id, email, name, departmentId, role, salt, hash, PBKDF2_ITER]
+    );
+    await logAudit(q, user, 'CREATE_EMPLOYEE', 'EMPLOYEE', id, `신규 직원 [${name} (${email})] 계정 생성`);
+  }).catch((e) => {
+    if (isUniqueViolation(e)) throw fail(400, '이미 존재하는 이메일 계정입니다.');
+    throw e;
+  });
+
+  const { link, delivery } = await issueResetToken({ id, name, email }, 72 * 60, 'invite');
+  await logAudit(db, user, delivery.ok ? 'INVITE_SENT' : 'INVITE_DELIVERY_FAILED', 'EMPLOYEE', id, `[${name}] 초대 ${delivery.ok ? `발송 (${delivery.channel})` : '발송 실패 - 관리자가 링크를 직접 전달해야 함'}`);
+
+  const created = mapUser((await db.query(`SELECT * FROM users WHERE id = $1`, [id])).rows[0]);
   res.json({
     success: true,
-    employee: publicUser(newEmp, user),
+    employee: publicUser(created, user),
     delivered: delivery.ok,
     deliveryError: delivery.ok ? undefined : delivery.error,
     // Only when automatic delivery failed: lets the administrator pass the link on personally.
     inviteLink: delivery.ok ? undefined : link,
   });
-});
+}));
 
 // 17-b. Admin: (Re)send an invitation or password-reset link
-app.post('/api/admin/employees/:id/invite', authMiddleware, async (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/employees/:id/invite', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'ADMIN') return res.status(403).json({ error: '시스템 관리자만 사용할 수 있습니다.' });
-  const target = db.users.find((u) => u.id === req.params.id);
-  if (!target) return res.status(404).json({ error: '직원을 찾을 수 없습니다.' });
-  if (target.status === 'DISABLED') return res.status(400).json({ error: '비활성화된 계정입니다.' });
+  if (user.role !== 'ADMIN') throw fail(403, '시스템 관리자만 사용할 수 있습니다.');
+  const found = await db.query(`SELECT * FROM users WHERE id = $1`, [req.params.id]);
+  if (!found.rows[0]) throw fail(404, '직원을 찾을 수 없습니다.');
+  const target = mapUser(found.rows[0]);
+  if (target.status === 'DISABLED') throw fail(400, '비활성화된 계정입니다.');
 
   const kind = target.status === 'INVITED' ? 'invite' : 'reset';
   const { link, delivery } = await issueResetToken(target, kind === 'invite' ? 72 * 60 : 30, kind);
-  logAudit(
+  await logAudit(
+    db,
     user,
     kind === 'invite' ? 'RESEND_INVITE' : 'ADMIN_RESET_LINK',
     'EMPLOYEE',
@@ -1174,78 +1110,99 @@ app.post('/api/admin/employees/:id/invite', authMiddleware, async (req: Authenti
     deliveryError: delivery.ok ? undefined : delivery.error,
     inviteLink: delivery.ok ? undefined : link,
   });
-});
+}));
 
 // 18. Admin: Toggle Employee Status (Active / Disabled)
-app.patch('/api/admin/employees/:id/status', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.patch('/api/admin/employees/:id/status', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'ADMIN') {
-    return res.status(403).json({ error: '시스템 관리자만 계정 상태를 변경할 수 있습니다.' });
-  }
+  if (user.role !== 'ADMIN') throw fail(403, '시스템 관리자만 계정 상태를 변경할 수 있습니다.');
 
-  const target = db.users.find((u) => u.id === req.params.id);
-  if (!target) return res.status(404).json({ error: '직원을 찾을 수 없습니다.' });
-  if (target.id === user.id) return res.status(400).json({ error: '본인 계정은 비활성화할 수 없습니다.' });
-  if (target.status === 'INVITED') return res.status(400).json({ error: '아직 활성화되지 않은 초대 계정입니다.' });
+  const status = await transact(async ({ q }) => {
+    const found = await q.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!found.rows[0]) throw fail(404, '직원을 찾을 수 없습니다.');
+    const target = mapUser(found.rows[0]);
+    if (target.id === user.id) throw fail(400, '본인 계정은 비활성화할 수 없습니다.');
+    if (target.status === 'INVITED') throw fail(400, '아직 활성화되지 않은 초대 계정입니다.');
 
-  target.status = target.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE';
-  if (target.status === 'DISABLED') revokeSessions(target.id);
-  saveDB(db);
-
-  logAudit(user, 'TOGGLE_EMPLOYEE_STATUS', 'EMPLOYEE', target.id, `직원 [${target.name}] 상태 -> ${target.status}`);
-  res.json({ success: true, status: target.status });
-});
+    const next = target.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE';
+    await q.query(`UPDATE users SET status = $2 WHERE id = $1`, [target.id, next]);
+    if (next === 'DISABLED') await revokeSessions(q, target.id);
+    await logAudit(q, user, 'TOGGLE_EMPLOYEE_STATUS', 'EMPLOYEE', target.id, `직원 [${target.name}] 상태 -> ${next}`);
+    return next;
+  });
+  res.json({ success: true, status });
+}));
 
 // 19. Admin: Create Department
-app.post('/api/admin/departments', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/departments', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'ADMIN') return res.status(403).json({ error: '관리자만 부서를 등록할 수 있습니다.' });
+  if (user.role !== 'ADMIN') throw fail(403, '관리자만 부서를 등록할 수 있습니다.');
   const name = cleanStr(req.body?.name, 60);
-  if (!name) return res.status(400).json({ error: '부서명을 입력하세요.' });
-  if (db.departments.some((d) => d.name === name)) return res.status(400).json({ error: '이미 존재하는 부서명입니다.' });
+  if (!name) throw fail(400, '부서명을 입력하세요.');
 
-  const dept = { id: newId('dept'), name, headEmployeeId: '' };
-  db.departments.push(dept);
-  logAudit(user, 'CREATE_DEPARTMENT', 'DEPARTMENT', dept.id, `부서 [${name}] 등록`);
-  res.json({ success: true, department: dept });
-});
+  const id = newId('dept');
+  await transact(async ({ q }) => {
+    await q.query(`INSERT INTO departments (id, name) VALUES ($1,$2)`, [id, name]);
+    await logAudit(q, user, 'CREATE_DEPARTMENT', 'DEPARTMENT', id, `부서 [${name}] 등록`);
+  }).catch((e) => {
+    if (isUniqueViolation(e)) throw fail(400, '이미 존재하는 부서명입니다.');
+    throw e;
+  });
+  res.json({ success: true, department: { id, name, headEmployeeId: '' } });
+}));
 
 // 20. Admin: Update Department Head
-app.patch('/api/admin/departments/:id/head', authMiddleware, (req: AuthenticatedRequest, res) => {
+app.patch('/api/admin/departments/:id/head', authMiddleware, route(async (req, res) => {
   const user = req.user!;
-  if (user.role !== 'ADMIN') {
-    return res.status(403).json({ error: '관리자만 부서장을 임명할 수 있습니다.' });
-  }
+  if (user.role !== 'ADMIN') throw fail(403, '관리자만 부서장을 임명할 수 있습니다.');
 
-  const dept = db.departments.find((d) => d.id === req.params.id);
-  if (!dept) return res.status(404).json({ error: '부서를 찾을 수 없습니다.' });
+  await transact(async ({ q }) => {
+    const dept = (await q.query(`SELECT * FROM departments WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+    if (!dept) throw fail(404, '부서를 찾을 수 없습니다.');
 
-  const targetUser = db.users.find((u) => u.id === req.body?.headEmployeeId);
-  if (!targetUser || targetUser.status !== 'ACTIVE' || targetUser.role === 'ADMIN') {
-    return res.status(400).json({ error: '활성 상태의 직원만 부서장으로 임명할 수 있습니다.' });
-  }
+    const target = (await q.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [req.body?.headEmployeeId])).rows[0];
+    if (!target || target.status !== 'ACTIVE' || target.role === 'ADMIN') throw fail(400, '활성 상태의 직원만 부서장으로 임명할 수 있습니다.');
 
-  const previousHeadId = dept.headEmployeeId;
-  dept.headEmployeeId = targetUser.id;
-  targetUser.role = 'APPROVER';
+    const previousHeadId: string | null = dept.head_employee_id;
+    await q.query(`UPDATE departments SET head_employee_id = $2 WHERE id = $1`, [dept.id, target.id]);
+    await q.query(`UPDATE users SET role = 'APPROVER' WHERE id = $1`, [target.id]);
 
-  // Demote the previous head unless they still head another department.
-  const prev = db.users.find((u) => u.id === previousHeadId);
-  if (prev && prev.id !== targetUser.id && prev.role === 'APPROVER' && !db.departments.some((d) => d.headEmployeeId === prev.id)) {
-    prev.role = 'EMPLOYEE';
-  }
-  saveDB(db);
-
-  logAudit(user, 'UPDATE_DEPT_HEAD', 'DEPARTMENT', dept.id, `[${dept.name}] 부서장 -> ${targetUser.name}`);
+    // Demote the previous head unless they still head another department.
+    if (previousHeadId && previousHeadId !== target.id) {
+      const still = await q.query(`SELECT 1 FROM departments WHERE head_employee_id = $1`, [previousHeadId]);
+      if (still.rows.length === 0) await q.query(`UPDATE users SET role = 'EMPLOYEE' WHERE id = $1 AND role = 'APPROVER'`, [previousHeadId]);
+    }
+    await logAudit(q, user, 'UPDATE_DEPT_HEAD', 'DEPARTMENT', dept.id, `[${dept.name}] 부서장 -> ${target.name}`);
+  });
   res.json({ success: true });
-});
+}));
 
 // -------------------------------------------------------------
 // Vite Integration & Server Startup
 // -------------------------------------------------------------
 async function startServer() {
+  db = await openDb(DATA_DIR);
+  await migrate(db);
+
+  const users = (await db.query(`SELECT count(*)::int AS n FROM users`)).rows[0].n;
+  if (users === 0 && fs.existsSync(path.join(DATA_DIR, 'database.json'))) {
+    console.warn(
+      `[db] ${path.join(DATA_DIR, 'database.json')} 가 있습니다. 기존 데이터를 옮기려면 서버를 시작하기 전에 \`npm run db:import\` 를 먼저 실행하세요. (그대로 시작하면 빈 데이터베이스로 시작합니다)`
+    );
+  }
+  if (db.kind === 'embedded' && isProduction) {
+    console.warn('[db] DATABASE_URL 이 없어 내장 PostgreSQL(단일 인스턴스 전용)을 사용합니다. 운영에서는 관리형 PostgreSQL(DATABASE_URL)을 권장합니다.');
+  }
+
   await bootstrapAdmin();
   await verifySlack();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, b] of rateBuckets) if (b.resetAt <= now) rateBuckets.delete(k);
+    db.query(`DELETE FROM auth_tokens WHERE expires_at < now()`).catch((e) => console.error('[db] token purge failed:', e.message));
+  }, 10 * 60_000).unref();
+
   if (!isProduction) {
     // Development mode with Vite Middleware
     const vite = await createViteServer({
@@ -1262,9 +1219,20 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[ScheduleSync Pro Server] listening on http://0.0.0.0:${PORT} (env: ${process.env.NODE_ENV || 'dev'})`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[ScheduleSync Pro Server] listening on http://0.0.0.0:${PORT} (env: ${process.env.NODE_ENV || 'dev'}, db: ${db.kind})`);
   });
+
+  const shutdown = (signal: string) => {
+    console.log(`[server] ${signal} 수신, 종료합니다.`);
+    server.close(() => db.close().finally(() => process.exit(0)));
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-startServer();
+startServer().catch((e) => {
+  console.error('[FATAL] 서버를 시작하지 못했습니다:', e);
+  process.exit(1);
+});
