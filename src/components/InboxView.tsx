@@ -14,7 +14,7 @@ import {
   ChevronRight,
   Info,
 } from 'lucide-react';
-import { Assignment, SessionChangeRequest, Project } from '../types';
+import { Assignment, SessionChangeRequest, Project, CHANGE_CLOSE_REASONS } from '../types';
 import { KR_DAYS, checkEmployeeOverlap, formatDateTime } from '../utils/dateAndRrule';
 
 interface InboxViewProps {
@@ -35,6 +35,7 @@ export const InboxView: React.FC<InboxViewProps> = ({ onSelectProject }) => {
     respondAssignment,
     decideApproval,
     decideChangeRequest,
+    withdrawChangeRequest,
   } = useApp();
 
   const [activeSubTab, setActiveSubTab] = useState<'accept' | 'approval' | 'change'>('accept');
@@ -72,6 +73,12 @@ export const InboxView: React.FC<InboxViewProps> = ({ onSelectProject }) => {
       cr.status === 'CHANGE_PENDING' &&
       cr.decisions.some((d) => d.actorId === currentUserId)
   );
+
+  // 3-b. Requests I filed myself: pending ones can be withdrawn; closed ones explain why nothing happened.
+  const myChangeRequests = changeRequests
+    .filter((cr) => cr.requestedBy === currentUserId && (cr.status === 'CHANGE_PENDING' || !!cr.closedReason))
+    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+    .slice(0, 6);
 
   // Handle Accept assignment
   const handleAcceptAssignment = async (asg: Assignment) => {
@@ -521,6 +528,41 @@ export const InboxView: React.FC<InboxViewProps> = ({ onSelectProject }) => {
             · 상대 허가권자 등록 프로젝트와 겹치는 경우: <strong>상대 허가권자 승인 + 해당 참여 직원 동의</strong>가 모두 있어야 변경이 반영됩니다.<br />
             · 승인자 반려 또는 동의 대상자 1명이라도 거절 시 전체 반려되며, <strong>기존 일정이 유지</strong>됩니다.
           </div>
+
+          {myChangeRequests.length > 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs space-y-2 text-xs">
+              <span className="font-semibold text-slate-800">내가 요청한 일정 변경</span>
+              {myChangeRequests.map((cr) => {
+                const proj = projects.find((p) => p.id === cr.projectId);
+                const pending = cr.status === 'CHANGE_PENDING';
+                const done = cr.decisions.filter((d) => d.decision === 'APPROVED').length;
+                return (
+                  <div key={cr.id} className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50">
+                    <div className="space-y-0.5">
+                      <div className="font-medium text-slate-900">[{proj?.name}] · {formatDateTime(cr.createdAt)}</div>
+                      {pending ? (
+                        <div className="text-slate-600">승인·동의 {done}/{cr.decisions.length} 완료 — 모두 완료되면 반영됩니다.</div>
+                      ) : (
+                        <div className="text-amber-800">{cr.closedReason ? CHANGE_CLOSE_REASONS[cr.closedReason] : '종료됨'}</div>
+                      )}
+                    </div>
+                    {pending && (
+                      <button
+                        onClick={async () => {
+                          const res = await withdrawChangeRequest(cr.id);
+                          if (res.success) showToast('일정 변경 요청을 철회했습니다.');
+                          else showToast(res.error || '철회 실패', true);
+                        }}
+                        className="px-3 py-1.5 border border-slate-300 text-slate-700 hover:bg-white font-semibold rounded-lg cursor-pointer"
+                      >
+                        요청 철회
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {changeReviewList.length === 0 ? (
             <div className="bg-white p-10 rounded-xl border border-slate-200 text-center text-xs text-slate-400">

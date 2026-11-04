@@ -940,6 +940,100 @@ app.post('/api/assignments/:id/release', authMiddleware, route(async (req, res) 
   res.json({ success: true });
 }));
 
+// -------------------------------------------------------------
+// Schedule changes & change requests
+//
+// A change request is a decision about a *specific* situation: the schedule as it was, and the conflicts the
+// approvers were shown. Before it is approved (and again right before it is applied) the server checks that
+// this situation still holds; otherwise the request is closed instead of silently overwriting newer state.
+// -------------------------------------------------------------
+type CloseReason = 'BASE_CHANGED' | 'NEW_CONFLICT' | 'PROJECT_CLOSED' | 'OWNER_CHANGED' | 'REQUESTER_INACTIVE' | 'WITHDRAWN_BY_REQUESTER';
+
+const CLOSE_MESSAGES: Record<CloseReason, string> = {
+  BASE_CHANGED: '요청 이후 프로젝트 일정이 바뀌어 요청이 무효화되었습니다. 다시 요청해 주세요.',
+  NEW_CONFLICT: '요청 이후 승인받지 않은 새로운 시간 겹침이 생겨 요청이 무효화되었습니다. 다시 요청해 주세요.',
+  PROJECT_CLOSED: '프로젝트가 취소되었거나 종료되어 요청이 무효화되었습니다.',
+  OWNER_CHANGED: '프로젝트 등록자가 바뀌어 요청이 무효화되었습니다.',
+  REQUESTER_INACTIVE: '요청자가 더 이상 허가권자가 아니거나 비활성화되어 요청이 무효화되었습니다.',
+  WITHDRAWN_BY_REQUESTER: '요청자가 변경 요청을 철회했습니다.',
+};
+
+/** Fingerprint of everything a schedule change is based on: the project's date range and its sessions (ids excluded). */
+async function scheduleFingerprint(q: Queryable, projectId: string): Promise<string> {
+  const p = (await q.query(`SELECT start_date, end_date FROM projects WHERE id = $1`, [projectId])).rows[0];
+  const s = (
+    await q.query(
+      `SELECT title, start_at, end_at, rrule, days_of_week, start_time, end_time, timezone FROM sessions WHERE project_id = $1 ORDER BY position`,
+      [projectId]
+    )
+  ).rows;
+  return sha256(JSON.stringify([p?.start_date, p?.end_date, s]));
+}
+
+async function activeParticipants(q: Queryable, projectId: string): Promise<string[]> {
+  return (
+    await q.query(`SELECT DISTINCT employee_id FROM assignments WHERE project_id = $1 AND status = ANY($2::text[]) ORDER BY employee_id`, [projectId, ACTIVE_ASSIGNMENT_STATUSES])
+  ).rows.map((r) => r.employee_id as string);
+}
+
+/** Identifies one conflict between an employee, another project and two concrete time slots. */
+const conflictKey = (employeeId: string, c: any) =>
+  [
+    employeeId,
+    c.conflictingProject.id,
+    `${c.targetSession.dateStr} ${c.targetSession.startTime}-${c.targetSession.endTime}`,
+    `${c.conflictingSession.dateStr} ${c.conflictingSession.startTime}-${c.conflictingSession.endTime}`,
+  ].join('|');
+
+/**
+ * Conflicts that the proposed schedule would create with projects owned by *other* approvers. Those are the ones
+ * that need the other approver's approval and the employee's consent. Conflicts with the requester's own projects,
+ * or involving the requester personally, only need a warning acknowledgement (handled in the client).
+ * Participants must already be locked by the caller.
+ */
+async function crossOwnerConflicts(q: Queryable, projectId: string, requesterId: string, proposed: SessionInput[], participants: string[]) {
+  const out: { employeeId: string; conflict: any }[] = [];
+  for (const employeeId of participants) {
+    const check = await serverConflicts(q, employeeId, projectId, proposed);
+    for (const conflict of check.conflicts) {
+      if (conflict.conflictingProject.createdBy === requesterId || employeeId === requesterId) continue;
+      out.push({ employeeId, conflict });
+    }
+  }
+  return out;
+}
+
+/** Why a pending change request can no longer be applied as approved, or null when it still holds. */
+async function findStaleReason(q: Queryable, cr: any): Promise<CloseReason | null> {
+  const proj = (await q.query(`SELECT * FROM projects WHERE id = $1`, [cr.project_id])).rows[0];
+  if (!proj || proj.status === 'CANCELLED' || proj.status === 'COMPLETED') return 'PROJECT_CLOSED';
+  if (proj.created_by !== cr.requested_by) return 'OWNER_CHANGED';
+  const requester = (await q.query(`SELECT role, status FROM users WHERE id = $1`, [cr.requested_by])).rows[0];
+  if (!requester || requester.status !== 'ACTIVE' || requester.role !== 'APPROVER') return 'REQUESTER_INACTIVE';
+  // NULL on requests created before re-validation existed: nothing to compare, the conflict check below still applies.
+  if (cr.base_hash && cr.base_hash !== (await scheduleFingerprint(q, cr.project_id))) return 'BASE_CHANGED';
+
+  // Every conflict that exists now must be one the approvers have been shown ('*' = stored without employee id).
+  const shown = new Set<string>((cr.conflicts as any[]).map((c) => conflictKey(c.employeeId ?? '*', c)));
+  const participants = await activeParticipants(q, cr.project_id);
+  for (const { employeeId, conflict } of await crossOwnerConflicts(q, cr.project_id, cr.requested_by, cr.proposed_sessions, participants)) {
+    if (!shown.has(conflictKey(employeeId, conflict)) && !shown.has(conflictKey('*', conflict))) return 'NEW_CONFLICT';
+  }
+  return null;
+}
+
+/** Closes a pending request without a decision and tells everyone who was involved. */
+async function closeChangeRequest(c: Ctx, cr: any, projectName: string, reason: CloseReason, actor: Pick<UserRecord, 'id' | 'name'>) {
+  await c.q.query(`UPDATE change_requests SET status = 'CHANGE_WITHDRAWN', closed_reason = $2, closed_at = now() WHERE id = $1`, [cr.id, reason]);
+  const decs = (await c.q.query(`SELECT actor_id FROM change_decisions WHERE change_request_id = $1`, [cr.id])).rows;
+  const recipients = new Set<string>([cr.requested_by, ...decs.map((d) => d.actor_id as string)]);
+  recipients.delete(actor.id);
+  for (const r of recipients) {
+    await notify(c, r, 'CHANGE_CLOSED', '일정 변경 요청 종료', `[${projectName}] ${CLOSE_MESSAGES[reason]}`, 'inbox');
+  }
+  await logAudit(c.q, actor, reason === 'WITHDRAWN_BY_REQUESTER' ? 'WITHDRAW_CHANGE_REQUEST' : 'CLOSE_CHANGE_REQUEST_STALE', 'CHANGE_REQUEST', cr.id, `[${projectName}] 일정 변경 요청 종료 (${reason})`);
+}
+
 // 15. Schedule Sessions & Change Requests
 app.put('/api/projects/:id/sessions', authMiddleware, route(async (req, res) => {
   const user = req.user!;
@@ -952,46 +1046,52 @@ app.put('/api/projects/:id/sessions', authMiddleware, route(async (req, res) => 
     const proj = await getProject(q, req.params.id, 'UPDATE');
     if (proj.createdBy !== user.id) throw fail(403, '자신이 등록한 프로젝트의 일정만 수정할 수 있습니다.');
 
-    const participants = (
-      await q.query(`SELECT DISTINCT employee_id FROM assignments WHERE project_id = $1 AND status = ANY($2::text[])`, [proj.id, ACTIVE_ASSIGNMENT_STATUSES])
-    ).rows.map((r) => r.employee_id as string);
+    const participants = await activeParticipants(q, proj.id);
     await lockEmployees(q, participants);
 
-    // Server-side decision on whether the change touches anyone else's schedule: `directApply` is never trusted.
-    const decisions: any[] = [];
-    const requestId = newId('cr');
-    const conflictsList: any[] = [];
-    for (const empId of participants) {
-      const check = await serverConflicts(q, empId, proj.id, proposed);
-      for (const cf of check.conflicts) {
-        if (cf.conflictingProject.createdBy === user.id || empId === user.id) continue;
-        conflictsList.push(cf);
-        const ownerId = cf.conflictingProject.createdBy;
-        const ownerDec = decisions.find((d) => d.actorId === ownerId);
-        if (!ownerDec) decisions.push({ id: newId('cd'), actorId: ownerId, kind: 'APPROVAL' });
-        const empDec = decisions.find((d) => d.actorId === empId);
-        if (empDec) {
-          if (empDec.kind === 'APPROVAL') empDec.kind = 'BOTH';
-        } else {
-          decisions.push({ id: newId('cd'), actorId: empId, kind: 'CONSENT' });
-        }
-      }
+    // Only one request at a time: a second one would be based on a schedule that is about to change.
+    // A pending request that is no longer valid is closed automatically so it never blocks anyone.
+    const pending = (await q.query(`SELECT * FROM change_requests WHERE project_id = $1 AND status = 'CHANGE_PENDING' FOR UPDATE`, [proj.id])).rows[0];
+    if (pending) {
+      const stale = await findStaleReason(q, pending);
+      if (!stale) throw fail(409, '이미 진행 중인 일정 변경 요청이 있습니다. 처리 결과를 기다리거나 요청을 철회한 뒤 다시 시도하세요.', { pendingRequestId: pending.id });
+      await closeChangeRequest(c, pending, proj.name, stale, user);
     }
 
-    if (conflictsList.length === 0) {
+    // Server-side decision on whether the change touches anyone else's schedule: `directApply` is never trusted.
+    const found = await crossOwnerConflicts(q, proj.id, user.id, proposed, participants);
+
+    if (found.length === 0) {
       await replaceSessions(q, proj.id, proposed);
       await logAudit(q, user, 'UPDATE_SESSIONS_DIRECT', 'SESSION', proj.id, `[${proj.name}] 일정 변경 반영`);
       return { appliedDirectly: true as const };
     }
 
     // Another approver's project overlaps: a change request with approval + consent is mandatory.
-    await q.query(`INSERT INTO change_requests (id, project_id, requested_by, proposed_sessions, conflicts, status) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,'CHANGE_PENDING')`, [
-      requestId,
-      proj.id,
-      user.id,
-      JSON.stringify(proposed),
-      JSON.stringify(conflictsList),
-    ]);
+    const decisions: { id: string; actorId: string; kind: 'APPROVAL' | 'CONSENT' | 'BOTH' }[] = [];
+    for (const { employeeId, conflict } of found) {
+      const ownerId = conflict.conflictingProject.createdBy;
+      if (!decisions.some((d) => d.actorId === ownerId)) decisions.push({ id: newId('cd'), actorId: ownerId, kind: 'APPROVAL' });
+      const empDec = decisions.find((d) => d.actorId === employeeId);
+      if (empDec) {
+        if (empDec.kind === 'APPROVAL') empDec.kind = 'BOTH';
+      } else {
+        decisions.push({ id: newId('cd'), actorId: employeeId, kind: 'CONSENT' });
+      }
+    }
+
+    const requestId = newId('cr');
+    await q.query(
+      `INSERT INTO change_requests (id, project_id, requested_by, proposed_sessions, conflicts, status, base_hash) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,'CHANGE_PENDING',$6)`,
+      [
+        requestId,
+        proj.id,
+        user.id,
+        JSON.stringify(proposed),
+        JSON.stringify(found.map((f) => ({ ...f.conflict, employeeId: f.employeeId }))),
+        await scheduleFingerprint(q, proj.id),
+      ]
+    );
     for (const d of decisions) {
       await q.query(`INSERT INTO change_decisions (id, change_request_id, actor_id, kind, decision) VALUES ($1,$2,$3,$4,'PENDING')`, [d.id, requestId, d.actorId, d.kind]);
       await notify(c, d.actorId, 'CHANGE_REQUEST', '일정 변경 승인/동의 요청', `[${proj.name}] 일정 변경에 대한 ${d.kind === 'CONSENT' ? '동의' : '승인'}가 필요합니다.`, 'inbox');
@@ -1001,6 +1101,9 @@ app.put('/api/projects/:id/sessions', authMiddleware, route(async (req, res) => 
     const cr = (await q.query(`SELECT * FROM change_requests WHERE id = $1`, [requestId])).rows[0];
     const cds = (await q.query(`SELECT * FROM change_decisions WHERE change_request_id = $1 ORDER BY id`, [requestId])).rows;
     return { appliedDirectly: false as const, changeRequest: mapChangeRequest(cr, cds) };
+  }).catch((e) => {
+    if (isUniqueViolation(e)) throw fail(409, '이미 진행 중인 일정 변경 요청이 있습니다. 처리 결과를 기다리거나 요청을 철회한 뒤 다시 시도하세요.');
+    throw e;
   });
   res.json({ success: true, ...result });
 }));
@@ -1016,9 +1119,12 @@ app.post('/api/change-requests/:id/decision', authMiddleware, route(async (req, 
     const { q } = c;
     const crPeek = (await q.query(`SELECT project_id FROM change_requests WHERE id = $1`, [req.params.id])).rows[0];
     if (!crPeek) throw fail(404, '요청을 찾을 수 없습니다.');
-    await lockProject(q, crPeek.project_id, 'UPDATE');
+    const proj = await getProject(q, crPeek.project_id, 'UPDATE');
+    // Same lock order as everywhere else: project first, then the employees whose schedules are affected.
+    await lockEmployees(q, await activeParticipants(q, proj.id));
+
     const cr = (await q.query(`SELECT * FROM change_requests WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
-    if (cr.status !== 'CHANGE_PENDING') throw fail(409, '진행 중인 변경 요청이 아닙니다.');
+    if (cr.status !== 'CHANGE_PENDING') throw fail(409, '진행 중인 변경 요청이 아닙니다.', { closedReason: cr.closed_reason ?? undefined });
 
     const my = (await q.query(`SELECT * FROM change_decisions WHERE change_request_id = $1 AND actor_id = $2 FOR UPDATE`, [cr.id, user.id])).rows[0];
     if (!my) throw fail(403, '본인에게 할당된 승인/동의 요청이 아닙니다.');
@@ -1029,25 +1135,47 @@ app.post('/api/change-requests/:id/decision', authMiddleware, route(async (req, 
       await q.query(`UPDATE change_requests SET status='CHANGE_REJECTED' WHERE id=$1`, [cr.id]);
       await notify(c, cr.requested_by, 'CHANGE_REJECTED', '일정 변경 반려', `일정 변경 요청이 ${user.name}님에 의해 반려되었습니다.`, 'inbox');
       await logAudit(q, user, 'REJECT_CHANGE_REQUEST', 'CHANGE_REQUEST', cr.id, `일정 변경 반려 (사유: ${note || '미입력'})`);
-      return {};
+      return { stale: false as const };
+    }
+
+    // Approving something that no longer holds would be a decision about a situation that no longer exists.
+    const stale = await findStaleReason(q, cr);
+    if (stale) {
+      await closeChangeRequest(c, cr, proj.name, stale, user);
+      return { stale: true as const, reason: stale };
     }
 
     await q.query(`UPDATE change_decisions SET decision='APPROVED', comment=$2, decided_at=now() WHERE id=$1`, [my.id, note]);
     const open = (await q.query(`SELECT count(*)::int AS n FROM change_decisions WHERE change_request_id = $1 AND decision <> 'APPROVED'`, [cr.id])).rows[0].n;
-    if (open > 0) return { allApproved: false };
+    if (open > 0) return { stale: false as const, allApproved: false };
 
-    // Everyone agreed: apply the proposed schedule. Participants are locked like any other schedule change.
-    const participants = (
-      await q.query(`SELECT DISTINCT employee_id FROM assignments WHERE project_id = $1 AND status = ANY($2::text[])`, [cr.project_id, ACTIVE_ASSIGNMENT_STATUSES])
-    ).rows.map((r) => r.employee_id as string);
-    await lockEmployees(q, participants);
+    // Everyone agreed and everything was just re-validated under the same locks: apply the proposed schedule.
     await replaceSessions(q, cr.project_id, cr.proposed_sessions as SessionInput[]);
     await q.query(`UPDATE change_requests SET status='CHANGE_APPROVED' WHERE id=$1`, [cr.id]);
     await notify(c, cr.requested_by, 'CHANGE_APPROVED', '일정 변경 승인', '일정 변경 요청이 최종 승인되어 캘린더에 반영되었습니다.', 'calendar');
     await logAudit(q, user, 'APPROVE_CHANGE_REQUEST_FINAL', 'CHANGE_REQUEST', cr.id, '일정 변경 최종 승인 및 캘린더 반영');
-    return { allApproved: true };
+    return { stale: false as const, allApproved: true };
   });
-  res.json({ success: true, ...result });
+
+  // The request was closed (and everybody notified) in the transaction above; tell the caller why nothing was approved.
+  if (result.stale) throw fail(409, CLOSE_MESSAGES[result.reason], { stale: true, closedReason: result.reason });
+  res.json({ success: true, allApproved: (result as any).allApproved });
+}));
+
+// 16-b. Change Request Withdraw (by the requester, while pending)
+app.post('/api/change-requests/:id/withdraw', authMiddleware, route(async (req, res) => {
+  const user = req.user!;
+  await transact(async (c) => {
+    const { q } = c;
+    const crPeek = (await q.query(`SELECT project_id FROM change_requests WHERE id = $1`, [req.params.id])).rows[0];
+    if (!crPeek) throw fail(404, '요청을 찾을 수 없습니다.');
+    const proj = await getProject(q, crPeek.project_id, 'UPDATE');
+    const cr = (await q.query(`SELECT * FROM change_requests WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+    if (cr.requested_by !== user.id) throw fail(403, '요청한 허가권자만 철회할 수 있습니다.');
+    if (cr.status !== 'CHANGE_PENDING') throw fail(409, '진행 중인 변경 요청만 철회할 수 있습니다.');
+    await closeChangeRequest(c, cr, proj.name, 'WITHDRAWN_BY_REQUESTER', user);
+  });
+  res.json({ success: true });
 }));
 
 // 17. Admin: Create Employee Account (invitation flow; no shared initial password)

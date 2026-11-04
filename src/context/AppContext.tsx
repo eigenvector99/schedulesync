@@ -103,6 +103,7 @@ interface AppContextType {
     error?: string;
   }>;
 
+  withdrawChangeRequest: (requestId: string) => Promise<{ success: boolean; error?: string }>;
   decideChangeRequest: (
     requestId: string,
     decision: 'APPROVED' | 'REJECTED',
@@ -702,7 +703,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         await refreshState();
         return { success: true };
       }
+      // A stale request is closed by the server (and everyone notified): show that, not the old state.
+      if (data.stale || data.closedReason) await refreshState();
       return { success: false, error: data.error };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  };
+
+  const withdrawChangeRequest = async (requestId: string) => {
+    try {
+      const res = await fetch(`/api/change-requests/${requestId}/withdraw`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      const data = await res.json();
+      await refreshState();
+      return res.ok ? { success: true } : { success: false, error: data.error };
     } catch (e: any) {
       return { success: false, error: e.message };
     }
@@ -853,6 +870,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         releaseAssignment,
         requestSessionChange,
         decideChangeRequest,
+        withdrawChangeRequest,
         markNotificationRead,
         markAllNotificationsRead,
         createEmployeeAccount,

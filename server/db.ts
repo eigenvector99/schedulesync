@@ -125,7 +125,9 @@ export function splitSql(sql: string): string[] {
     if (!inDollar && line.trim().startsWith('--')) continue;
     cur += line + '\n';
     if ((line.match(/\$\$/g) || []).length % 2 === 1) inDollar = !inDollar;
-    if (!inDollar && line.trimEnd().endsWith(';')) {
+    // a trailing `-- comment` must not hide the statement terminator
+    const code = line.replace(/\s--.*$/, '').trimEnd();
+    if (!inDollar && code.endsWith(';')) {
       out.push(cur.trim());
       cur = '';
     }

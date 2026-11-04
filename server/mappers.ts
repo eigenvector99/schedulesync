@@ -111,6 +111,8 @@ export const mapChangeRequest = (r: any, decisions: any[] = []) => ({
   proposedSessions: r.proposed_sessions,
   conflicts: r.conflicts,
   status: r.status,
+  closedReason: opt(r.closed_reason),
+  closedAt: iso(r.closed_at),
   createdAt: iso(r.created_at),
   decisions: decisions.map(mapChangeDecision),
 });
