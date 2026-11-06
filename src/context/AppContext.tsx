@@ -48,6 +48,8 @@ interface AppContextType {
 
   // Auth actions
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
+  /** Finishes a Slack sign-in: trades the one-time code from the redirect for a session. */
+  completeSsoLogin: (code: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
   changePassword: (curr: string, next: string) => Promise<{ success: boolean; error?: string }>;
   requestPasswordReset: (email: string) => Promise<{ success: boolean; error?: string }>;
@@ -252,6 +254,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } else {
         return { success: false, error: data.error || '로그인 실패' };
       }
+    } catch (e: any) {
+      return { success: false, error: e.message || '서버 통신 오류' };
+    }
+  };
+
+  // 1-b. Auth: Slack sign-in (the redirect brings back a one-time code)
+  const completeSsoLogin = async (code: string) => {
+    try {
+      const res = await fetch('/api/auth/slack/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json();
+      if (!res.ok) return { success: false, error: data.error || 'Slack 로그인에 실패했습니다.' };
+      localStorage.setItem(TOKEN_KEY, data.token);
+      setToken(data.token);
+      setCurrentUser(data.user);
+      await refreshState();
+      return { success: true };
     } catch (e: any) {
       return { success: false, error: e.message || '서버 통신 오류' };
     }
@@ -857,6 +879,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         activeTab,
         setActiveTab,
         login,
+        completeSsoLogin,
         logout,
         changePassword,
         requestPasswordReset,

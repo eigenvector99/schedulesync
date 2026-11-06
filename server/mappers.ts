@@ -15,6 +15,7 @@ export interface UserRecord {
   passwordIter: number | null;
   resetTokenHash: string | null;
   resetTokenExpiresAt: string | null;
+  slackUserId: string | null;
 }
 
 const iso = (v: any): string | undefined => (v == null ? undefined : v instanceof Date ? v.toISOString() : String(v));
@@ -34,11 +35,12 @@ export const mapUser = (r: any): UserRecord => ({
   passwordIter: r.password_iter ?? null,
   resetTokenHash: r.reset_token_hash ?? null,
   resetTokenExpiresAt: iso(r.reset_token_expires_at) ?? null,
+  slackUserId: r.slack_user_id ?? null,
 });
 
 /** What other people (and the browser) may see of a user; e-mail only for the owner and administrators. */
 export function publicUser(u: UserRecord, viewer: UserRecord) {
-  const { passwordHash, passwordSalt, passwordIter, resetTokenHash, resetTokenExpiresAt, ...safe } = u;
+  const { passwordHash, passwordSalt, passwordIter, resetTokenHash, resetTokenExpiresAt, slackUserId, ...safe } = u;
   if (viewer.role !== 'ADMIN' && viewer.id !== u.id) return { ...safe, email: '' };
   return safe;
 }
